@@ -1,0 +1,15 @@
+run_name: sample-phase1
+objectmorpher_ply: ObjectMorpher/sample.ply
+output_root: runs
+image_width: 256
+image_height: 256
+fovy_degrees: 60.0
+trajectory:
+  kind: orbit
+  frames: 24
+  radius: 2.0
+  elevation_degrees: 15.0
+supergaussian:
+  prior: realbasicvsr
+  low_res_size: 64
+  high_res_size: 256
