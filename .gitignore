@@ -37,3 +37,7 @@ venv/
 
 # development
 docs/
+
+# Local build artifacts of OM/SG CUDA extensions (rebuild per machine)
+ObjectMorpher/submodules/**/build/
+ObjectMorpher/submodules/**/*.egg-info/
