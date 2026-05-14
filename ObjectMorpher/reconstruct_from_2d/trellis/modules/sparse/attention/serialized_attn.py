@@ -9,6 +9,8 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    pass
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
 

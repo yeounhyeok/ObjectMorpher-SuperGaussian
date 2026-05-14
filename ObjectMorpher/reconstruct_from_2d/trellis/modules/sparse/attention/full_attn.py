@@ -7,6 +7,8 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    pass
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
 
@@ -206,6 +208,23 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif ATTN == 'sdpa':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        # q: [T_q, H, C_in], k: [T_kv, H, C_in], v: [T_kv, H, C_out]
+        # Variable-length self/cross attention via per-batch SDPA loop (block-diagonal mask).
+        q_starts = torch.tensor([0] + list(q_seqlen)).cumsum(0).tolist()
+        kv_starts = torch.tensor([0] + list(kv_seqlen)).cumsum(0).tolist()
+        outs = []
+        for i in range(len(q_seqlen)):
+            qb = q[q_starts[i]:q_starts[i + 1]].transpose(0, 1).unsqueeze(0)
+            kb = k[kv_starts[i]:kv_starts[i + 1]].transpose(0, 1).unsqueeze(0)
+            vb = v[kv_starts[i]:kv_starts[i + 1]].transpose(0, 1).unsqueeze(0)
+            ob = torch.nn.functional.scaled_dot_product_attention(qb, kb, vb)
+            outs.append(ob.squeeze(0).transpose(0, 1))
+        out = torch.cat(outs, dim=0)
     else:
         raise ValueError(f"Unknown attention module: {ATTN}")
     

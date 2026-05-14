@@ -6,11 +6,21 @@ from PIL import Image
 import os
 
 class SimplifiedSAMProcessor:
-    def __init__(self, model_type="vit_h", checkpoint_path="/home/xyhugo/3d-scene-editor/checkpoints/sam/sam_vit_h_4b8939.pth", max_display_size=800, output_base_dir="/home/xyhugo/2D-SpaceEdit/outputs"):
+    def __init__(self, model_type="vit_h", checkpoint_path=None, max_display_size=800, output_base_dir=None):
         """初始化SAM模型"""
+        if checkpoint_path is None:
+            checkpoint_path = os.environ.get(
+                "OM_SAM_CKPT",
+                "/home/xyhugo/3d-scene-editor/checkpoints/sam/sam_vit_h_4b8939.pth",
+            )
+        if output_base_dir is None:
+            output_base_dir = os.environ.get(
+                "OM_SAM_OUTPUT_DIR",
+                "/home/xyhugo/2D-SpaceEdit/outputs",
+            )
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
-        
+
         # 加载模型
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
         self.sam.to(device=self.device)
@@ -63,9 +73,9 @@ class SimplifiedSAMProcessor:
         for dir_name, dir_path in self.output_dirs.items():
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path, exist_ok=True)
-                print(f"✓ 创建目录: {dir_path}")
+                print(f"✓ 디렉토리 생성: {dir_path}")
             else:
-                print(f"✓ 目录已存在: {dir_path}")
+                print(f"✓ 디렉토리 이미 존재: {dir_path}")
     
     def resize_for_display(self, image):
         """调整图像到合适的显示尺寸"""
@@ -80,7 +90,7 @@ class SimplifiedSAMProcessor:
         new_h = int(h * self.scale_factor)
         
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"图像缩放: {w}x{h} -> {new_w}x{new_h} (缩放比例: {self.scale_factor:.2f})")
+        print(f"이미지 리사이즈: {w}x{h} -> {new_w}x{new_h} (배율: {self.scale_factor:.2f})")
         
         return resized
     
@@ -142,12 +152,12 @@ class SimplifiedSAMProcessor:
     def adjust_dilation_size(self, change):
         """调整扩张核大小"""
         self.dilation_kernel_size = max(1, self.dilation_kernel_size + change)
-        print(f"📏 扩张核大小: {self.dilation_kernel_size}")
+        print(f"📏 dilation 커널: {self.dilation_kernel_size}")
     
     def adjust_brush_size(self, change):
         """调整画笔大小"""
         self.brush_size = max(5, min(100, self.brush_size + change))
-        print(f"🖌️ 画笔大小: {self.brush_size}")
+        print(f"🖌️ 브러시 크기: {self.brush_size}")
 
     # 新增：获取当前可提交的工作mask（优先涂抹中的mask）
     def get_current_working_mask(self):
@@ -163,7 +173,7 @@ class SimplifiedSAMProcessor:
         """
         mask = self.get_current_working_mask()
         if mask is None or not np.any(mask):
-            print("❌ 没有可提交的区域，请先分割或涂抹一些区域。")
+            print("❌ 커밋할 영역 없음 — 먼저 객체 선택 또는 페인트로 영역을 만들어주세요.")
             return False
 
         if self.combined_mask is None:
@@ -176,8 +186,8 @@ class SimplifiedSAMProcessor:
         pct = area / total * 100
         combined_area = int(np.sum(self.combined_mask))
         combined_pct = combined_area / total * 100
-        print(f"✅ 已提交阶段区域: {area} 像素 ({pct:.2f}%)")
-        print(f"📦 累计并集面积: {combined_area} 像素 ({combined_pct:.2f}%)")
+        print(f"✅ 단계 커밋: {area} 픽셀 ({pct:.2f}%)")
+        print(f"📦 누적 합집합: {combined_area} 픽셀 ({combined_pct:.2f}%)")
 
         # 清空当前工作选择，方便下一次分割
         self.points = []
@@ -192,21 +202,21 @@ class SimplifiedSAMProcessor:
     # 新增：清空阶段累计
     def clear_combined(self):
         self.combined_mask = None
-        print("🗑️ 已清空阶段累计区域。")
+        print("🗑️ 누적 영역 비움.")
         self.update_display()
     
     def toggle_paint_mode(self):
         """切换涂抹模式"""
         self.paint_mode = not self.paint_mode
         if self.paint_mode:
-            print(f"🎨 进入涂抹模式 (画笔大小: {self.brush_size})")
-            print("   左键涂抹，右键清除，ESC退出涂抹模式")
+            print(f"🎨 페인트 모드 진입 (브러시: {self.brush_size})")
+            print("   좌클릭=칠하기, 우클릭=지우기, ESC=페인트 모드 종료")
             # 初始化涂抹mask
             if self.original_image is not None:
                 h, w = self.original_image.shape[:2]
                 self.paint_mask = np.zeros((h, w), dtype=bool)
         else:
-            print("🎯 退出涂抹模式，回到SAM点击模式")
+            print("🎯 페인트 모드 종료 — SAM 클릭 모드로 복귀")
         self.update_display()
     
     def paint_at_position(self, x, y):
@@ -238,7 +248,7 @@ class SimplifiedSAMProcessor:
         """清除涂抹mask"""
         if self.paint_mask is not None:
             self.paint_mask.fill(False)
-            print("🧹 清除涂抹区域")
+            print("🧹 페인트 영역 지움")
             self.update_display()
     
     def finalize_paint_mask(self):
@@ -248,7 +258,7 @@ class SimplifiedSAMProcessor:
             # 清除点击点，因为现在用的是涂抹mask
             self.points = []
             self.labels = []
-            print("✅ 涂抹区域已设为当前mask")
+            print("✅ 페인트 영역을 현재 mask 로 확정")
             return True
         return False
         
@@ -272,14 +282,14 @@ class SimplifiedSAMProcessor:
                 orig_x, orig_y = self.display_coord_to_original(x, y)
                 self.points.append([orig_x, orig_y])
                 self.labels.append(1)
-                print(f"添加正向点: ({orig_x}, {orig_y})")
+                print(f"+ 포함점 추가: ({orig_x}, {orig_y})")
                 self.update_mask()
                 
             elif event == cv2.EVENT_RBUTTONDOWN:
                 orig_x, orig_y = self.display_coord_to_original(x, y)
                 self.points.append([orig_x, orig_y])
                 self.labels.append(0)
-                print(f"添加负向点: ({orig_x}, {orig_y})")
+                print(f"- 제외점 추가: ({orig_x}, {orig_y})")
                 self.update_mask()
     
     def update_mask(self):
@@ -311,10 +321,10 @@ class SimplifiedSAMProcessor:
         percentage = (area / total_area) * 100
         dilated_percentage = (dilated_area / total_area) * 100
         edge_percentage = (edge_area / total_area) * 100
-        print(f"原始区域: {area} 像素 ({percentage:.1f}%)")
-        print(f"扩张区域: {dilated_area} 像素 ({dilated_percentage:.1f}%)")
-        print(f"边缘区域: {edge_area} 像素 ({edge_percentage:.1f}%)")
-        print(f"扩张核大小: {self.dilation_kernel_size}")
+        print(f"원본 영역: {area} 픽셀 ({percentage:.1f}%)")
+        print(f"확장 영역: {dilated_area} 픽셀 ({dilated_percentage:.1f}%)")
+        print(f"에지 영역: {edge_area} 픽셀 ({edge_percentage:.1f}%)")
+        print(f"dilation 커널: {self.dilation_kernel_size}")
     
     def update_display(self):
         """更新显示（通用方法）"""
@@ -394,11 +404,11 @@ class SimplifiedSAMProcessor:
                 cv2.circle(display_image, (disp_x, disp_y), 5, (255, 255, 255), 2)
         
         # 添加模式指示器
-        mode_text = "🎨 涂抹模式" if self.paint_mode else "🎯 SAM模式"
+        mode_text = "PAINT mode" if self.paint_mode else "SAM mode"
         if self.paint_mode:
-            mode_text += f" (画笔: {self.brush_size})"
+            mode_text += f" (brush: {self.brush_size})"
         if self.combined_mask is not None:
-            mode_text += " + 已累计"
+            mode_text += " + accumulated"
         cv2.putText(display_image, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(display_image, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
 
@@ -409,7 +419,7 @@ class SimplifiedSAMProcessor:
         # 使用最终mask（combined优先）
         final_mask = self.combined_mask if self.combined_mask is not None else self.current_mask
         if final_mask is None:
-            print("❌ 请先选择或累计物体区域！")
+            print("❌ 먼저 객체 영역을 선택하거나 누적하세요!")
             return None
         
         mask = final_mask
@@ -418,7 +428,7 @@ class SimplifiedSAMProcessor:
         # 找到物体边界
         y_indices, x_indices = np.where(mask)
         if len(x_indices) == 0:
-            print("❌ 没有选中任何区域！")
+            print("❌ 선택된 영역이 없습니다!")
             return None
         
         x_min, x_max = x_indices.min(), x_indices.max()
@@ -439,7 +449,7 @@ class SimplifiedSAMProcessor:
         pil_image = Image.fromarray(result, 'RGBA')
         pil_image.save(object_path)
         
-        print(f"✓ 透明背景物体: {object_path} ({w}x{h})")
+        print(f"✓ 투명배경 객체 저장: {object_path} ({w}x{h})")
         return object_path
     
     def save_background_with_hole(self, base_name, use_dilated_mask=True):
@@ -453,18 +463,18 @@ class SimplifiedSAMProcessor:
         # 使用最终mask（combined优先）
         final_mask = self.combined_mask if self.combined_mask is not None else self.current_mask
         if final_mask is None:
-            print("❌ 请先选择或累计物体区域！")
+            print("❌ 먼저 객체 영역을 선택하거나 누적하세요!")
             return None
         
         # 选择使用原始mask还是扩张mask
         if use_dilated_mask:
             mask = self.dilate_mask(final_mask)
             suffix = "_background_dilated_hole"
-            print(f"🔍 使用扩张mask (核大小: {self.dilation_kernel_size})")
+            print(f"🔍 확장 mask 사용 (커널: {self.dilation_kernel_size})")
         else:
             mask = final_mask
             suffix = "_background_hole"
-            print("🔍 使用原始精确mask")
+            print("🔍 정밀 mask 사용")
         
         image = self.original_image
         
@@ -479,7 +489,7 @@ class SimplifiedSAMProcessor:
         pil_image = Image.fromarray(background)
         pil_image.save(background_path, quality=95)
         
-        print(f"✓ 有洞背景: {background_path}")
+        print(f"✓ 배경(구멍) 저장: {background_path}")
         return background_path
     
     def save_mask_file(self, base_name, use_dilated_mask=True):
@@ -493,26 +503,26 @@ class SimplifiedSAMProcessor:
         # 使用最终mask（combined优先）
         final_mask = self.combined_mask if self.combined_mask is not None else self.current_mask
         if final_mask is None:
-            print("❌ 请先选择或累计物体区域！")
+            print("❌ 먼저 객체 영역을 선택하거나 누적하세요!")
             return None
         
         if use_dilated_mask:
             mask = self.dilate_mask(final_mask)
             suffix = "_mask"
             output_dir = self.output_dirs['mask_dilated']
-            print(f"🔍 保存扩张mask (核大小: {self.dilation_kernel_size})")
+            print(f"🔍 확장 mask 저장 (커널: {self.dilation_kernel_size})")
         else:
             mask = final_mask
             suffix = "_mask"
             output_dir = self.output_dirs['mask_precise']
-            print("🔍 保存原始精确mask")
+            print("🔍 정밀 mask 저장")
         
         # 保存mask为PNG
         mask_uint8 = mask.astype(np.uint8) * 255
         mask_path = os.path.join(output_dir, f"{base_name}{suffix}.png")
         cv2.imwrite(mask_path, mask_uint8)
         
-        print(f"✓ Mask文件: {mask_path}")
+        print(f"✓ Mask 파일: {mask_path}")
         return mask_path
     
     def save_edge_mask_file(self, base_name):
@@ -525,7 +535,7 @@ class SimplifiedSAMProcessor:
         # 使用最终mask（combined优先）
         final_mask = self.combined_mask if self.combined_mask is not None else self.current_mask
         if final_mask is None:
-            print("❌ 请先选择或累计物体区域！")
+            print("❌ 먼저 객체 영역을 선택하거나 누적하세요!")
             return None
         
         edge_mask = self.get_edge_mask(final_mask)
@@ -539,8 +549,8 @@ class SimplifiedSAMProcessor:
         total_area = edge_mask.shape[0] * edge_mask.shape[1]
         edge_percentage = (edge_area / total_area) * 100
 
-        print(f"✓ 边缘Mask文件: {edge_path}")
-        print(f"🔍 边缘区域: {edge_area} 像素 ({edge_percentage:.1f}%) (核大小: {self.dilation_kernel_size})")
+        print(f"✓ 에지 Mask 파일: {edge_path}")
+        print(f"🔍 에지 영역: {edge_area} 픽셀 ({edge_percentage:.1f}%) (커널: {self.dilation_kernel_size})")
         return edge_path
     
     def save_all_outputs(self, base_name, use_dilated_for_inpainting=True):
@@ -554,10 +564,10 @@ class SimplifiedSAMProcessor:
         # 修复：允许仅使用 combined_mask 的情况
         final_mask = self.combined_mask if self.combined_mask is not None else self.current_mask
         if final_mask is None or not np.any(final_mask):
-            print("❌ 请先选择或累计物体区域！")
+            print("❌ 먼저 객체 영역을 선택하거나 누적하세요!")
             return None
 
-        print(f"\n保存所有输出文件到 {self.output_base_dir}")
+        print(f"\n전체 출력 저장 → {self.output_base_dir}")
         print("-" * 60)
         
         # 保存透明背景物体到objects目录（始终使用精确mask）
@@ -582,8 +592,8 @@ class SimplifiedSAMProcessor:
         edge_mask_path = self.save_edge_mask_file(base_name)
         
         print("-" * 60)
-        print("✅ 所有文件已保存到对应目录！")
-        print(f"📁 输出目录结构:")
+        print("✅ 모든 파일 저장 완료!")
+        print(f"📁 출력 디렉토리 구조:")
         print(f"   {self.output_dirs['objects']}")
         print(f"   {self.output_dirs['holes']}")
         print(f"   {self.output_dirs['mask_dilated']}")
@@ -609,7 +619,7 @@ class SimplifiedSAMProcessor:
         self.original_image = cv2.imread(image_path)
         self.original_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
         
-        print(f"✓ 图像加载: {self.original_image.shape[1]}x{self.original_image.shape[0]}")
+        print(f"✓ 이미지 로드: {self.original_image.shape[1]}x{self.original_image.shape[0]}")
         
         # 设置SAM图像
         self.predictor.set_image(self.original_image)
@@ -624,38 +634,38 @@ class SimplifiedSAMProcessor:
         self.update_display()
         
         print("\n" + "="*70)
-        print("🎯 SAM 物体选择器 (支持Mask扩张优化+阶段累计)")
+        print("🎯 SAM 객체 선택기 (마스크 dilation + 단계 누적 지원)")
         print("="*70)
-        print("📁 输出目录配置:")
-        print(f"   物体文件: {self.output_dirs['objects']}")
-        print(f"   背景文件: {self.output_dirs['holes']}")
-        print(f"   扩张Mask: {self.output_dirs['mask_dilated']}")
-        print(f"   精确Mask: {self.output_dirs['mask_precise']}")
-        print(f"   边缘Mask: {self.output_dirs['mask_edge']}")
+        print("📁 출력 디렉토리:")
+        print(f"   객체 (투명배경): {self.output_dirs['objects']}")
+        print(f"   배경 (구멍):     {self.output_dirs['holes']}")
+        print(f"   확장 마스크:     {self.output_dirs['mask_dilated']}")
+        print(f"   정밀 마스크:     {self.output_dirs['mask_precise']}")
+        print(f"   에지 마스크:     {self.output_dirs['mask_edge']}")
         print()
-        print("🖱️  鼠标操作:")
-        print("   左键: 选择物体区域")
-        print("   右键: 排除区域")
-        print("\n⌨️  键盘操作:")
-        print("   'SPACE': 💾 保存所有输出 (默认用扩张mask)")
-        print("   'ENTER': 💾 保存所有输出 (用精确mask)")
-        print("   'o':     💾 只保存透明背景物体")
-        print("   'b':     💾 保存背景 (扩张mask)")
-        print("   'B':     💾 保存背景 (精确mask)")
-        print("   'e':     💾 只保存边缘mask")
-        print("   'p':     🎨 切换涂抹模式")
-        print("   'ESC':   🎯 退出涂抹模式")
-        print("   'f':     ✅ 确认涂抹区域 (涂抹模式下)")
-        print("   '[':     🖌️ 缩小画笔 (-5)")
-        print("   ']':     🖌️ 放大画笔 (+5)")
-        print("   '+':     🔍 增大扩张核 (+2)")
-        print("   '-':     🔍 减小扩张核 (-2)")
-        print("   'c':     📌 提交当前阶段到累计（组合并集）")
-        print("   'C':     🗑️ 清空阶段累计")
-        print("   'r':     🔄 重置当前选择（不影响已累计）")
-        print("   'q':     ❌ 退出")
+        print("🖱️  마우스:")
+        print("   좌클릭: 객체 포함 (positive)")
+        print("   우클릭: 영역 제외 (negative)")
+        print("\n⌨️  키보드:")
+        print("   'SPACE': 💾 전체 저장 (확장 mask 기본)")
+        print("   'ENTER': 💾 전체 저장 (정밀 mask)")
+        print("   'o':     💾 ⭐ 투명배경 객체만 저장 (TRELLIS 입력용)")
+        print("   'b':     💾 배경 저장 (확장 mask)")
+        print("   'B':     💾 배경 저장 (정밀 mask)")
+        print("   'e':     💾 에지 mask만 저장")
+        print("   'p':     🎨 페인트 모드 토글 (수동 마스크 보정)")
+        print("   'ESC':   🎯 페인트 모드 종료")
+        print("   'f':     ✅ 페인트 영역 확정 (페인트 모드 안에서)")
+        print("   '[':     🖌️ 브러시 축소 (-5)")
+        print("   ']':     🖌️ 브러시 확대 (+5)")
+        print("   '+':     🔍 dilation 커널 +2")
+        print("   '-':     🔍 dilation 커널 -2")
+        print("   'c':     📌 현재 선택을 누적에 커밋 (합집합)")
+        print("   'C':     🗑️ 누적 비우기")
+        print("   'r':     🔄 현재 선택 리셋 (누적은 유지)")
+        print("   'q':     ❌ 종료")
         print("="*70)
-        print("💡 绿色=当前选择, 蓝色=已累计阶段区域, 红色边缘=当前选择的扩张区域")
+        print("💡 초록=현재 선택, 파랑=누적 영역, 빨강 외곽=현재 선택의 확장 영역")
         
         # 主循环
         should_exit = False
@@ -664,39 +674,39 @@ class SimplifiedSAMProcessor:
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord('q'):
-                print("👋 退出程序")
+                print("👋 종료")
                 break
             elif key == ord(' '):  # 空格键 - 保存所有输出（扩张mask）
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
                 results = self.save_all_outputs(base_name, use_dilated_for_inpainting=True)
                 if results:
-                    print(f"\n🎉 输出文件已保存 (使用扩张mask):")
-                    print(f"   📦 物体文件: {os.path.basename(results['object'])}")
-                    print(f"   🕳️  背景文件: {os.path.basename(results['background_hole'])}")
-                    print(f"   🎭 主要Mask: {os.path.basename(results['mask'])}")
-                    print(f"   🎭 备用Mask: {os.path.basename(results['alternative_mask'])}")
-                    print(f"   🔲 边缘Mask: {os.path.basename(results['edge_mask'])}")
-                    print(f"\n📁 文件位置:")
+                    print(f"\n🎉 출력 저장 완료 (확장 mask 사용):")
+                    print(f"   📦 객체 파일:   {os.path.basename(results['object'])}")
+                    print(f"   🕳️  배경 파일:   {os.path.basename(results['background_hole'])}")
+                    print(f"   🎭 주 Mask:     {os.path.basename(results['mask'])}")
+                    print(f"   🎭 보조 Mask:   {os.path.basename(results['alternative_mask'])}")
+                    print(f"   🔲 에지 Mask:   {os.path.basename(results['edge_mask'])}")
+                    print(f"\n📁 위치:")
                     print(f"   {self.output_base_dir}/")
                     print(f"   ├── objects/")
                     print(f"   ├── holes/")
                     print(f"   ├── mask_dilated/")
                     print(f"   ├── mask_precise/")
                     print(f"   └── mask_edge/")
-                    print(f"\n💡 下一步: 使用PixelHacker修复背景")
-                    print(f"   推荐使用holes/目录中的扩张文件获得更好效果！")
+                    print(f"\n💡 다음 단계: 배경 inpainting (PixelHacker)")
+                    print(f"   확장 mask 의 holes/ 결과를 쓰면 inpainting 결과가 더 좋음")
                     if auto_exit_on_save:
                         should_exit = True
             elif key == 13:  # Enter键 - 保存所有输出（精确mask）
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
                 results = self.save_all_outputs(base_name, use_dilated_for_inpainting=False)
                 if results:
-                    print(f"\n🎉 输出文件已保存 (使用精确mask):")
-                    print(f"   📦 物体文件: {os.path.basename(results['object'])}")
-                    print(f"   🕳️  背景文件: {os.path.basename(results['background_hole'])}")
-                    print(f"   🎭 主要Mask: {os.path.basename(results['mask'])}")
-                    print(f"   🎭 备用Mask: {os.path.basename(results['alternative_mask'])}")
-                    print(f"   🔲 边缘Mask: {os.path.basename(results['edge_mask'])}")
+                    print(f"\n🎉 출력 저장 완료 (정밀 mask 사용):")
+                    print(f"   📦 객체 파일:   {os.path.basename(results['object'])}")
+                    print(f"   🕳️  배경 파일:   {os.path.basename(results['background_hole'])}")
+                    print(f"   🎭 주 Mask:     {os.path.basename(results['mask'])}")
+                    print(f"   🎭 보조 Mask:   {os.path.basename(results['alternative_mask'])}")
+                    print(f"   🔲 에지 Mask:   {os.path.basename(results['edge_mask'])}")
                     if auto_exit_on_save:
                         should_exit = True
             elif key == ord('o'):
@@ -738,7 +748,7 @@ class SimplifiedSAMProcessor:
                 # 退出涂抹模式
                 if self.paint_mode:
                     self.paint_mode = False
-                    print("🎯 退出涂抹模式，回到SAM点击模式")
+                    print("🎯 페인트 모드 종료 — SAM 클릭 모드로 복귀")
                     self.update_display()
             elif key == ord('f'):
                 # 确认涂抹区域
@@ -758,10 +768,10 @@ class SimplifiedSAMProcessor:
                 if self.paint_mask is not None:
                     self.paint_mask.fill(False)
                 self.update_display()
-                print("🔄 已重置选择")
+                print("🔄 현재 선택 리셋")
 
             if auto_exit_on_save and should_exit:
-                print("✅ 已保存，自动退出SAM窗口")
+                print("✅ 저장 완료 — SAM 창 자동 종료")
                 break
         
         cv2.destroyAllWindows()
@@ -769,7 +779,10 @@ class SimplifiedSAMProcessor:
 
 def main():
     # 查找图像文件
-    image_path = "/home/xyhugo/2D-SpaceEdit/materials/images/car1.png"
+    image_path = os.environ.get(
+        "OM_SAM_INPUT",
+        "/home/xyhugo/2D-SpaceEdit/materials/images/car1.png",
+    )
     
     if not os.path.exists(image_path):
         # 自动查找图像文件
@@ -778,10 +791,10 @@ def main():
         
         if current_images:
             image_path = current_images[0]
-            print(f"📸 自动选择图像: {image_path}")
+            print(f"📸 자동 선택된 이미지: {image_path}")
         else:
-            print("❌ 未找到图像文件！")
-            print("请将图像文件放在当前目录下")
+            print("❌ 이미지 파일을 찾지 못했습니다.")
+            print("   현재 디렉토리에 이미지 파일을 두거나 OM_SAM_INPUT 환경변수로 경로를 지정하세요.")
             return
     
     # 创建处理器并运行
