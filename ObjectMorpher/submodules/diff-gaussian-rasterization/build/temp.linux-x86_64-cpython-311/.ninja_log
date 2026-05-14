@@ -1,0 +1,6 @@
+# ninja log v7
+1	5336	1778784575877872797	/home/guest/workspace/projectWorkspace/ObjectMorpher+SuperGS/ObjectMorpher/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/forward.o	5a8f4e7231f1ca59
+0	5646	1778784575876872826	/home/guest/workspace/projectWorkspace/ObjectMorpher+SuperGS/ObjectMorpher/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/backward.o	3bd8724e807f583f
+2	14715	1778784575878872768	/home/guest/workspace/projectWorkspace/ObjectMorpher+SuperGS/ObjectMorpher/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/cuda_rasterizer/rasterizer_impl.o	6e7fc661e8a861b1
+3	23988	1778784575879872740	/home/guest/workspace/projectWorkspace/ObjectMorpher+SuperGS/ObjectMorpher/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/ext.o	770499f480650923
+4	62394	1778784575880872711	/home/guest/workspace/projectWorkspace/ObjectMorpher+SuperGS/ObjectMorpher/submodules/diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-311/rasterize_points.o	44e20269339c1f0c
