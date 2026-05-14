@@ -2,7 +2,11 @@
 .agent_runs/
 config/
 scripts/
+!adapter/scripts/
 README.md
+
+# Large model checkpoints (download locally; not for the repo)
+ckpts/
 
 # Adapter/runtime outputs
 runs/*
@@ -29,3 +33,7 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+
+# development
+docs/
