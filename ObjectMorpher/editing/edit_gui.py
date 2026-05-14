@@ -3,8 +3,13 @@ import time
 import torch
 from gaussian_renderer import render
 import sys
-from scene import GaussianModel
+import importlib.util
 from utils.general_utils import safe_state
+from utils.scene_lifting_utils import (
+    editable_mask_from_projection,
+    gate_deformation_values,
+    load_scene_metadata,
+)
 import uuid
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -16,7 +21,6 @@ import datetime
 from PIL import Image
 from train_gui_utils import DeformKeypoints
 from scipy.spatial.transform import Rotation as R
-import pytorch3d.ops
 try:
     from torch_batch_svd import svd
     print('Using speed up torch_batch_svd!')
@@ -31,6 +35,62 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+def _load_gaussian_model_module():
+    module_path = os.path.join(os.path.dirname(__file__), "scene", "gaussian_model.py")
+    spec = importlib.util.spec_from_file_location("objectmorpher_edit_gaussian_model", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load GaussianModel from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_gaussian_model_module = _load_gaussian_model_module()
+GaussianModel = _gaussian_model_module.GaussianModel
+quaternion_multiply = _gaussian_model_module.quaternion_multiply
+
+
+def knn_points(x, y, K):
+    dists = torch.cdist(x, y, p=2).square()
+    knn_dists, knn_idxs = torch.topk(dists, k=K, dim=-1, largest=False, sorted=True)
+    return knn_dists, knn_idxs, None
+
+
+def farthest_point_sample(xyz, npoint):
+    device = xyz.device
+    batch_size, point_count, channels = xyz.shape
+    centroids = torch.zeros(batch_size, npoint, dtype=torch.long, device=device)
+    distance = torch.ones(batch_size, point_count, device=device) * 1e10
+    farthest = torch.randint(0, point_count, (batch_size,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(batch_size, 1, channels)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        distance[dist < distance] = dist[dist < distance]
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+
+def mean_knn_distance(points: torch.Tensor, k: int) -> torch.Tensor:
+    neighbor_count = min(max(int(k), 1) + 1, int(points.shape[0]))
+    if neighbor_count <= 1:
+        return torch.tensor(1e-6, dtype=points.dtype, device=points.device)
+    dist = torch.cdist(points, points, p=2)
+    nearest = torch.topk(dist, k=neighbor_count, dim=-1, largest=False, sorted=True).values[:, 1:]
+    nearest = torch.clamp(nearest, min=1e-6)
+    return torch.clamp(nearest.mean(), min=1e-6)
+
+
+def sample_control_nodes(points: torch.Tensor, args) -> torch.Tensor:
+    total_count = min(int(args.node_count), int(points.shape[0]))
+    if total_count <= 0:
+        return points
+    idx = farthest_point_sample(points[None], total_count)[0]
+    return points[idx]
 
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):
@@ -178,7 +238,7 @@ class NodeDriver:
     
     def geodesic_distance_floyd(self, cur_node, K=3):
         node_num = cur_node.shape[0]
-        nn_dist, nn_idx, _ = pytorch3d.ops.knn_points(cur_node[None], cur_node[None], None, None, K=K+1)
+        nn_dist, nn_idx, _ = knn_points(cur_node[None], cur_node[None], K=K+1)
         nn_dist, nn_idx = nn_dist[0]**.5, nn_idx[0]
         dist_mat = torch.inf * torch.ones([node_num, node_num], dtype=torch.float32, device=cur_node.device)
         dist_mat.scatter_(dim=1, index=nn_idx, src=nn_dist)
@@ -196,7 +256,7 @@ class NodeDriver:
                 offset = 1 if XisNode else 0
                 node_nn_dist = floyd_nn_dist[:, offset:K+offset]
                 node_nn_idxs = floyd_nn_idx[:, offset:K+offset]
-                nn1_dist, nn1_idxs, _ = pytorch3d.ops.knn_points(x[None], nodes[None], None, None, K=1)  # N, 1
+                nn1_dist, nn1_idxs, _ = knn_points(x[None], nodes[None], K=1)  # N, 1
                 nn1_dist, nn1_idxs = nn1_dist[0, :, 0], nn1_idxs[0, :, 0]  # N
                 nn_idxs = node_nn_idxs[nn1_idxs]  # N, K
                 nn_dist = node_nn_dist[nn1_idxs] + nn1_dist[:, None]  # N, K
@@ -205,7 +265,7 @@ class NodeDriver:
                 K = self.K if K is None else K
                 K = K + 1 if XisNode else K  # +1 for the node itself
                 # Weights of control nodes
-                nn_dist, nn_idxs, _ = pytorch3d.ops.knn_points(x[None], nodes[None], None, None, K=K)  # N, K
+                nn_dist, nn_idxs, _ = knn_points(x[None], nodes[None], K=K)  # N, K
                 nn_dist, nn_idxs = nn_dist[0], nn_idxs[0]  # N, K'
                 if XisNode:
                     nn_dist, nn_idxs = nn_dist[:, 1:], nn_idxs[:, 1:]  # N, K
@@ -288,6 +348,25 @@ class GUI:
 
         self.gaussians = GaussianModel(0)
         self.gaussians.load_ply(args.gs_path)
+        self.editable_mask = torch.ones((self.gaussians.get_xyz.shape[0],), dtype=torch.bool, device=self.gaussians.get_xyz.device)
+        if args.mask_mode == "object":
+            if args.edit_mask:
+                if not args.scene_meta:
+                    raise ValueError("--scene-meta is required when --mask-mode object is used with --edit-mask")
+                metadata = load_scene_metadata(args.scene_meta)
+                self.editable_mask = editable_mask_from_projection(
+                    self.gaussians.get_xyz,
+                    args.edit_mask,
+                    metadata,
+                    opacity=self.gaussians.get_opacity[:, 0],
+                )
+                editable_count = int(self.editable_mask.sum().item())
+                if editable_count == 0:
+                    raise ValueError("The projected edit mask selected zero Gaussians. Check --edit-mask and --scene-meta.")
+                print(f"Editable object Gaussians: {editable_count}/{self.editable_mask.numel()}")
+            else:
+                print("[EditMask] No --edit-mask provided; all Gaussians remain editable.")
+        self.initial_xyz = self.gaussians.get_xyz.detach().clone()
 
         bg_color = [1, 1, 1] if args.white_background else [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -298,6 +377,17 @@ class GUI:
         self.W = args.W
         self.H = args.H
         self.cam = OrbitCamera(args.W, args.H, r=args.radius, fovy=args.fovy)
+        self.cam.orbit_sensitivity = float(args.orbit_sensitivity)
+        self.cam.pan_sensitivity = float(args.pan_sensitivity)
+        if args.fit_camera:
+            xyz = self.gaussians.get_xyz.detach()
+            bbox_min = xyz.min(0).values
+            bbox_max = xyz.max(0).values
+            target = ((bbox_min + bbox_max) * 0.5).detach().cpu().numpy()
+            extent = float(torch.norm(bbox_max - bbox_min).detach().cpu().item())
+            self.cam.center = -target.astype(np.float32)
+            self.cam.radius = max(float(args.radius), extent * float(args.fit_camera_radius_scale))
+            print(f"Fit GUI camera to Gaussian bbox: target={target.tolist()} radius={self.cam.radius:.4f}")
         self.vis_scale_const = None
         self.mode = "render"
         self.seed = "random"
@@ -334,19 +424,144 @@ class GUI:
             self.register_dpg()
             self.test_step()
 
+    def _normalize_rotation_bias(self, d_rotation_bias):
+        if d_rotation_bias is None or not torch.is_tensor(d_rotation_bias):
+            return None
+        if d_rotation_bias.ndim == 1 and d_rotation_bias.shape[0] == 4:
+            d_rotation_bias = d_rotation_bias[None].repeat(self.gaussians.get_xyz.shape[0], 1)
+        if d_rotation_bias.ndim != 2 or d_rotation_bias.shape[-1] != 4:
+            print(f"[Warn] invalid d_rotation_bias shape: {tuple(d_rotation_bias.shape)}, disable it this frame.")
+            return None
+        return torch.nn.functional.normalize(d_rotation_bias, dim=-1)
+
+    def _current_deformation_values(self):
+        d_xyz, d_rotation, d_scaling, d_opacity, d_color = 0.0, 0.0, 0.0, 0.0, 0.0
+        d_rotation_bias = None
+        if hasattr(self, 'animator') and self.animation_trans_bias is not None:
+            d_values = self.animator(
+                self.gaussians.get_xyz,
+                self.control_nodes,
+                self.animation_trans_bias,
+                node_radius=float(getattr(self, "node_radius", 1.0)),
+            )
+            d_xyz = d_values['d_xyz']
+            d_rotation = d_values['d_rotation']
+            d_scaling = d_values['d_scaling']
+            d_opacity = d_values['d_opacity']
+            d_color = d_values['d_color']
+            d_rotation_bias = self._normalize_rotation_bias(d_values.get('d_rotation_bias', None))
+            deformation_mask = self._current_local_deformation_mask() if self.args.local_deform_gate else self.editable_mask
+            gated = gate_deformation_values(
+                editable_mask=deformation_mask,
+                d_xyz=d_xyz,
+                d_rotation=d_rotation,
+                d_scaling=d_scaling,
+                d_opacity=d_opacity,
+                d_color=d_color,
+                d_rotation_bias=d_rotation_bias,
+            )
+            d_xyz = gated['d_xyz']
+            d_rotation = gated['d_rotation']
+            d_scaling = gated['d_scaling']
+            d_opacity = gated['d_opacity']
+            d_color = gated['d_color']
+            d_rotation_bias = gated['d_rotation_bias']
+        return d_xyz, d_rotation, d_scaling, d_opacity, d_color, d_rotation_bias
+
+    def _current_local_deformation_mask(self):
+        if not hasattr(self, "deform_keypoints") or not hasattr(self, "control_nodes"):
+            return self.editable_mask
+        if len(self.deform_keypoints.get_kpt_idx()) == 0:
+            return self.editable_mask
+
+        moving = []
+        for node_idx, delta in zip(self.deform_keypoints.get_kpt_idx(), self.deform_keypoints.get_kpt_delta()):
+            if np.linalg.norm(delta) > self.args.local_deform_min_delta:
+                moving.append(int(node_idx))
+        if not moving:
+            return self.editable_mask
+
+        moving_tensor = torch.tensor(moving, device=self.control_nodes.device, dtype=torch.long)
+        if self.args.local_deform_node_rings > 0 and hasattr(self, "animate_tool") and self.animate_tool is not None:
+            moving_tensor = self.animate_tool.add_n_ring_nbs(moving_tensor, n=self.args.local_deform_node_rings)
+        moving_tensor = torch.unique(moving_tensor.long())
+
+        radius = float(getattr(self, "node_radius", torch.tensor(1.0)).detach().cpu().item())
+        radius *= float(self.args.local_deform_radius_scale)
+        cache_key = (
+            tuple(moving_tensor.detach().cpu().numpy().astype(int).tolist()),
+            round(radius, 8),
+            int(self.gaussians.get_xyz.shape[0]),
+        )
+        if getattr(self, "_local_deform_cache_key", None) == cache_key:
+            return self._local_deform_cache_mask
+
+        node_pos = self.control_nodes[moving_tensor]
+        selected = torch.zeros_like(self.editable_mask, dtype=torch.bool)
+        editable_idx = torch.where(self.editable_mask)[0]
+        radius_sq = radius * radius
+        chunk_size = 65536
+        for start in range(0, int(editable_idx.numel()), chunk_size):
+            idx = editable_idx[start : start + chunk_size]
+            dist_sq = torch.cdist(self.gaussians.get_xyz[idx], node_pos, p=2).pow(2).min(dim=1).values
+            selected[idx] = dist_sq <= radius_sq
+
+        self._local_deform_cache_key = cache_key
+        self._local_deform_cache_mask = selected
+        print(f"Local deformation gate: {int(selected.sum().item())}/{int(self.editable_mask.sum().item())} Gaussians")
+        return selected
+
+    def _tensor_or_default(self, value, default: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(value):
+            return value.detach()
+        return default.detach()
+
+    def _save_edit_state(self, path, d_xyz, d_rotation_bias, edited_xyz) -> None:
+        zero_xyz = torch.zeros_like(self.gaussians.get_xyz)
+        identity_rotation = torch.zeros((self.gaussians.get_xyz.shape[0], 4), device=self.gaussians.get_xyz.device)
+        identity_rotation[:, 0] = 1.0
+        np.savez_compressed(
+            path,
+            editable_mask=self.editable_mask.detach().cpu().numpy().astype(np.bool_),
+            initial_xyz=self.initial_xyz.detach().cpu().numpy(),
+            edited_xyz=edited_xyz.detach().cpu().numpy(),
+            d_xyz=self._tensor_or_default(d_xyz, zero_xyz).detach().cpu().numpy(),
+            d_rotation_bias=self._tensor_or_default(d_rotation_bias, identity_rotation).detach().cpu().numpy(),
+        )
+
     @torch.no_grad()
     def animation_initialize(self):
         from lap_deform import LapDeform
-        mask = (self.gaussians.get_opacity > 0.9)[:, 0]
+        opacity = self.gaussians.get_opacity[:, 0]
+        mask = (opacity > self.args.control_min_opacity) & self.editable_mask
+        if int(mask.sum().item()) < 4:
+            mask = (opacity > 0.05) & self.editable_mask
+        if int(mask.sum().item()) < 4:
+            raise ValueError("Need at least four editable Gaussians to initialize ARAP control nodes.")
         pcl = self.gaussians.get_xyz[mask]
-        from utils.time_utils import farthest_point_sample
-        pts_idx = farthest_point_sample(pcl[None], 512)[0]
-        pcl = pcl[pts_idx]
+        pcl = sample_control_nodes(pcl, self.args)
         scale = torch.norm(pcl.max(0).values - pcl.min(0).values)
-        node_radius = scale / 20
-        print(f'Static scene node radius: {node_radius}')
+        mean_nn = mean_knn_distance(pcl, self.args.mean_nn_k)
+        if self.args.node_radius_mode == "mean-nn":
+            node_radius = torch.clamp(mean_nn * self.args.node_radius_scale, min=1e-6)
+        else:
+            node_radius = torch.clamp(scale / 20, min=1e-6)
+        self.node_radius = node_radius
+        graph_radius = None
+        if self.args.graph_radius_mode == "mean-nn":
+            graph_radius = torch.clamp(mean_nn * self.args.graph_radius_scale, min=1e-6)
+        print(f'Static scene node radius: {node_radius}, mean_nn: {mean_nn}')
         self.control_nodes = pcl
-        self.animate_tool = LapDeform(init_pcl=pcl, K=4, trajectory=None, node_radius=node_radius)
+        self.animate_tool = LapDeform(
+            init_pcl=pcl,
+            K=4,
+            trajectory=None,
+            node_radius=node_radius,
+            graph_radius=graph_radius,
+            connectivity_mode=self.args.graph_mode,
+            graph_k=self.args.graph_k,
+            least_edge_num=self.args.least_edge_num,
+        )
         self.keypoint_idxs = []
         self.keypoint_3ds = []
         self.keypoint_labels = []
@@ -356,13 +571,27 @@ class GUI:
         self.animation_trans_bias = None
         self.animation_rot_bias = None
         self.buffer_overlay = None
+        self._local_deform_cache_key = None
+        self._local_deform_cache_mask = None
 
         self.control_nodes_gaussians = GaussianModel(0)
         from utils.graphics_utils import BasicPointCloud
         colors = self.control_nodes.clone()
-        colors = (colors - colors.min(0).values) / (colors.max(0).values - colors.min(0).values)
+        colors = (colors - colors.min(0).values) / (colors.max(0).values - colors.min(0).values).clamp_min(1e-6)
         pcd = BasicPointCloud(points=pcl.detach().cpu().numpy(), colors=colors.detach().cpu().numpy(), normals=None)
         self.control_nodes_gaussians.create_from_pcd(pcd=pcd)
+        self.control_nodes_gaussians._scaling = torch.nn.Parameter(
+            torch.full_like(
+                self.control_nodes_gaussians._scaling,
+                float(np.log(max(float(self.args.node_vis_scale), 1e-6))),
+            )
+        )
+        self.control_nodes_gaussians._opacity = torch.nn.Parameter(
+            torch.full_like(
+                self.control_nodes_gaussians._opacity,
+                float(np.log(float(self.args.node_vis_opacity) / max(1.0 - float(self.args.node_vis_opacity), 1e-6))),
+            )
+        )
 
         self.animator = NodeDriver()
         print('Initialize Animation Model with %d control nodes' % len(pcl))
@@ -380,6 +609,8 @@ class GUI:
         self.buffer_overlay = None
         self.motion_animation_d_values = None
         self.animator = NodeDriver()
+        self._local_deform_cache_key = None
+        self._local_deform_cache_mask = None
         print('Reset Animation Model ...')
 
     def __del__(self):
@@ -559,15 +790,37 @@ class GUI:
                             os.makedirs(self.args.model_path)
                         ply_files = sorted([file for file in os.listdir(self.args.model_path) if file.endswith('.ply') and file.startswith('edit')])
                         new_id = len(ply_files)
-                        if hasattr(self, 'animator') and self.animation_trans_bias is not None:
-                            d_values = self.animator(self.gaussians.get_xyz, self.control_nodes, self.animation_trans_bias)
-                            d_xyz, d_rotation, d_scaling, d_opacity, d_color = d_values['d_xyz'], d_values['d_rotation'], d_values['d_scaling'], d_values['d_opacity'], d_values['d_color']
+                        d_xyz, d_rotation, d_scaling, d_opacity, d_color, d_rotation_bias = self._current_deformation_values()
                         # Deep copy a new Gaussian
                         import copy
                         gaussian_new = copy.deepcopy(self.gaussians)
-                        gaussian_new._xyz = gaussian_new.get_xyz + d_xyz
-                        gaussian_new._rotation = gaussian_new.get_rotation * d_rotation
-                        gaussian_new.save_ply('{}/edit_{}.ply'.format(self.args.model_path, new_id))
+                        if torch.is_tensor(d_xyz):
+                            gaussian_new._xyz = torch.nn.Parameter((gaussian_new.get_xyz + d_xyz).detach().clone())
+                        if torch.is_tensor(d_rotation_bias):
+                            gaussian_new._rotation = torch.nn.Parameter(
+                                quaternion_multiply(d_rotation_bias, gaussian_new.get_rotation).detach().clone()
+                            )
+                        elif torch.is_tensor(d_rotation):
+                            gaussian_new._rotation = torch.nn.Parameter((gaussian_new._rotation + d_rotation).detach().clone())
+                        if torch.is_tensor(d_scaling):
+                            new_scaling = (gaussian_new.get_scaling + d_scaling).clamp_min(1e-6)
+                            gaussian_new._scaling = torch.nn.Parameter(gaussian_new.scaling_inverse_activation(new_scaling).detach().clone())
+                        if torch.is_tensor(d_opacity):
+                            gaussian_new._opacity = torch.nn.Parameter((gaussian_new._opacity + d_opacity).detach().clone())
+                        if torch.is_tensor(d_color):
+                            gaussian_new._features_dc = torch.nn.Parameter(
+                                (gaussian_new._features_dc + d_color[:, None]).detach().clone()
+                            )
+                        save_path = '{}/edit_{}.ply'.format(self.args.model_path, new_id)
+                        gaussian_new.save_ply(save_path)
+                        if self.args.save_edit_state:
+                            self._save_edit_state(
+                                os.path.join(self.args.model_path, f'edit_{new_id}.edit_state.npz'),
+                                d_xyz,
+                                d_rotation_bias,
+                                gaussian_new.get_xyz,
+                            )
+                            print(f"Save edit state to {os.path.join(self.args.model_path, f'edit_{new_id}.edit_state.npz')}")
                     dpg.add_button(
                         label="save",
                         tag="_button_save_model",
@@ -858,6 +1111,9 @@ class GUI:
 
                     # Project mouse_loc to points_3d
                     pw, ph = int(self.mouse_loc[0]), int(self.mouse_loc[1])
+                    if pw < 0 or pw >= self.W or ph < 0 or ph >= self.H:
+                        print(f"Ignore keypoint click outside render viewport: ({pw}, {ph})")
+                        return
 
                     d = out['depth'][0][ph, pw]
                     z = cur_cam.zfar / (cur_cam.zfar - cur_cam.znear) * d - cur_cam.zfar * cur_cam.znear / (cur_cam.zfar - cur_cam.znear)
@@ -876,7 +1132,12 @@ class GUI:
                     print(f'Add kpt: {self.deform_keypoints.selective_keypoints_idx_list}')
 
                 elif dpg.is_key_down(dpg.mvKey_S):
+                    if not self.deform_keypoints.contain_kpt(keypoint_idxs.item()):
+                        keypoint_3ds = nodes[keypoint_idxs]
+                        self.deform_keypoints.add_kpts(keypoint_3ds, keypoint_idxs)
+                        print(f'Add/select kpt: {self.deform_keypoints.selective_keypoints_idx_list}')
                     self.deform_keypoints.select_kpt(keypoint_idxs.item())
+                    print(f'Select kpt: {self.deform_keypoints.selective_keypoints_idx_list}')
 
                 elif dpg.is_key_down(dpg.mvKey_D):
                     if True:
@@ -1032,20 +1293,7 @@ class GUI:
             gaussians = self.control_nodes_gaussians
         else:
             if hasattr(self, 'animator') and self.animation_trans_bias is not None:
-                d_values = self.animator(self.gaussians.get_xyz, self.control_nodes, self.animation_trans_bias)
-                d_xyz, d_rotation, d_scaling, d_opacity, d_color = d_values['d_xyz'], d_values['d_rotation'], d_values['d_scaling'], d_values['d_opacity'], d_values['d_color']
-                d_rotation_bias = d_values.get('d_rotation_bias', None)
-
-                # 兼容不同实现/状态：renderer 里 quaternion_multiply 需要 Tensor[...,4]
-                if d_rotation_bias is not None:
-                    if not torch.is_tensor(d_rotation_bias):
-                        print(f"[Warn] invalid d_rotation_bias type: {type(d_rotation_bias)}, disable it this frame.")
-                        d_rotation_bias = None
-                    elif d_rotation_bias.ndim == 1 and d_rotation_bias.shape[0] == 4:
-                        d_rotation_bias = d_rotation_bias[None].repeat(self.gaussians.get_xyz.shape[0], 1)
-                    elif d_rotation_bias.ndim != 2 or d_rotation_bias.shape[-1] != 4:
-                        print(f"[Warn] invalid d_rotation_bias shape: {tuple(d_rotation_bias.shape)}, disable it this frame.")
-                        d_rotation_bias = None
+                d_xyz, d_rotation, d_scaling, d_opacity, d_color, d_rotation_bias = self._current_deformation_values()
             gaussians = self.gaussians
 
         out = render(
@@ -1166,7 +1414,6 @@ class GUI:
 
     def update_trajectory_overlay(self, gs_xyz, camera, samp_num=32, gs_num=512, thickness=1):
         if not hasattr(self, 'traj_coor') or self.traj_coor is None:
-            from utils.time_utils import farthest_point_sample
             self.traj_coor = torch.zeros([0, gs_num, 4], dtype=torch.float32).cuda()
             opacity_mask = self.gaussians.get_opacity[..., 0] > .1 if self.gaussians.get_xyz.shape[0] == gs_xyz.shape[0] else torch.ones_like(gs_xyz[:, 0], dtype=torch.bool)
             masked_idx = torch.arange(0, opacity_mask.shape[0], device=opacity_mask.device)[opacity_mask]
@@ -1393,8 +1640,33 @@ if __name__ == "__main__":
     parser.add_argument('--elevation', type=float, default=0, help="default GUI camera elevation")
     parser.add_argument('--radius', type=float, default=5, help="default GUI camera radius from center")
     parser.add_argument('--fovy', type=float, default=50, help="default GUI camera fovy")
+    parser.add_argument('--fit-camera', action='store_true', help="center the GUI camera on the loaded Gaussian bbox")
+    parser.add_argument('--fit-camera-radius-scale', type=float, default=3.0)
+    parser.add_argument('--orbit-sensitivity', type=float, default=0.05, help="Degrees per mouse pixel for left-drag orbit")
+    parser.add_argument('--pan-sensitivity', type=float, default=0.0001, help="World units per mouse pixel for middle-drag pan")
+    parser.add_argument('--node-count', type=int, default=512, help="Number of ARAP control nodes sampled by FPS")
+    parser.add_argument('--control-min-opacity', type=float, default=0.05, help="Opacity threshold for ARAP control-node candidates")
+    parser.add_argument('--node-vis-scale', type=float, default=0.006, help="Rendered Gaussian scale for control-node visualization")
+    parser.add_argument('--node-vis-opacity', type=float, default=0.95, help="Rendered opacity for control-node visualization")
+    parser.add_argument('--graph-mode', choices=('nn', 'floyd'), default='nn')
+    parser.add_argument('--graph-k', type=int, default=4)
+    parser.add_argument('--least-edge-num', type=int, default=3)
+    parser.add_argument('--mean-nn-k', type=int, default=4)
+    parser.add_argument('--node-radius-mode', choices=('bbox', 'mean-nn'), default='bbox')
+    parser.add_argument('--node-radius-scale', type=float, default=2.0)
+    parser.add_argument('--graph-radius-mode', choices=('bbox', 'mean-nn'), default='bbox')
+    parser.add_argument('--graph-radius-scale', type=float, default=4.0)
+    parser.add_argument('--local-deform-gate', action='store_true', help="Only apply Gaussian motion near nonzero-delta dragged control nodes")
+    parser.add_argument('--local-deform-radius-scale', type=float, default=3.0)
+    parser.add_argument('--local-deform-node-rings', type=int, default=1)
+    parser.add_argument('--local-deform-min-delta', type=float, default=1e-7)
     parser.add_argument('--white_background', action='store_true', default=False, help="use white background in GUI")
     parser.add_argument('--model_path', type=str, default='./', help="path to save the model and logs")
+    parser.add_argument('--source-image', type=str, default=None, help="source RGB image used for full-scene lifting")
+    parser.add_argument('--edit-mask', type=str, default=None, help="2D SAM mask that defines editable object Gaussians")
+    parser.add_argument('--scene-meta', type=str, default=None, help="SHARP scene_meta.json with source camera intrinsics/extrinsics")
+    parser.add_argument('--mask-mode', choices=['object', 'none'], default='object', help="Use the SAM object mask to gate ARAP deformation")
+    parser.add_argument('--save-edit-state', action='store_true', help="Save editable mask and deformation deltas next to edited PLY")
 
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)

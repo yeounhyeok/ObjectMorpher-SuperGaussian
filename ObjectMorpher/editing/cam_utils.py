@@ -77,6 +77,8 @@ class OrbitCamera:
                                            [0., 1., 0.]]))
         self.up = np.array([0, 1, 0], dtype=np.float32)  # need to be normalized!
         self.side = np.array([1, 0, 0], dtype=np.float32)
+        self.orbit_sensitivity = 0.05
+        self.pan_sensitivity = 0.0001
 
     @property
     def fovx(self):
@@ -139,8 +141,8 @@ class OrbitCamera:
         # rotate along camera up/side axis!
         side = self.rot.as_matrix()[:3, 0]
         up = self.rot.as_matrix()[:3, 1]
-        rotvec_x = up * np.radians(-0.05 * dx)
-        rotvec_y = side * np.radians(-0.05 * dy)
+        rotvec_x = up * np.radians(-self.orbit_sensitivity * dx)
+        rotvec_y = side * np.radians(-self.orbit_sensitivity * dy)
         self.rot = R.from_rotvec(rotvec_x) * R.from_rotvec(rotvec_y) * self.rot
 
     def scale(self, delta):
@@ -148,4 +150,4 @@ class OrbitCamera:
 
     def pan(self, dx, dy, dz=0):
         # pan in camera coordinate system (careful on the sensitivity!)
-        self.center += 0.0001 * self.rot.as_matrix()[:3, :3] @ np.array([-dx, -dy, dz])
+        self.center += self.pan_sensitivity * self.rot.as_matrix()[:3, :3] @ np.array([-dx, -dy, dz])

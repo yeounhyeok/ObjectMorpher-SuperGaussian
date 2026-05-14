@@ -17,7 +17,28 @@ import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except ImportError:
+    def distCUDA2(points: torch.Tensor) -> torch.Tensor:
+        """
+        Fallback for environments where the CUDA simple-knn extension is unavailable.
+
+        Returns the squared distance to the nearest neighbor for each point, which
+        matches the contract expected by the original Graphdeco initialization code.
+        This path is only used for small control point clouds in the GUI workflow,
+        so the O(N^2) implementation is acceptable.
+        """
+        if points.ndim != 2 or points.shape[-1] != 3:
+            raise ValueError(f"Expected point tensor of shape [N, 3], got {tuple(points.shape)}")
+        if points.shape[0] == 0:
+            return torch.empty((0,), device=points.device, dtype=points.dtype)
+        if points.shape[0] == 1:
+            return torch.full((1,), 1e-7, device=points.device, dtype=points.dtype)
+
+        nn_dist = torch.cdist(points, points, p=2)
+        nn_dist.fill_diagonal_(float("inf"))
+        return nn_dist.min(dim=1).values.square()
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, build_scaling_rotation_inverse
 
@@ -268,7 +289,20 @@ class GaussianModel:
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+        extra_f_names = sorted(extra_f_names, key=lambda name: int(name.split('_')[-1]))
+        expected_f_count = 3 * (self.max_sh_degree + 1) ** 2 - 3
+        if len(extra_f_names) != expected_f_count:
+            if len(extra_f_names) % 3 != 0:
+                raise ValueError(
+                    f"Invalid SH feature count in {path}: found {len(extra_f_names)} f_rest fields"
+                )
+            inferred_sh_degree = int(np.sqrt(len(extra_f_names) // 3 + 1) - 1)
+            inferred_f_count = 3 * (inferred_sh_degree + 1) ** 2 - 3
+            if inferred_f_count != len(extra_f_names):
+                raise ValueError(
+                    f"Cannot infer SH degree from {len(extra_f_names)} f_rest fields in {path}"
+                )
+            self.max_sh_degree = inferred_sh_degree
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
@@ -285,9 +319,9 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
         
-        fea_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("fea")]
+        fea_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("fea_")]
         feas = np.zeros((xyz.shape[0], self.fea_dim))
-        for idx, attr_name in enumerate(fea_names):
+        for idx, attr_name in enumerate(fea_names[: self.fea_dim]):
             feas[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))

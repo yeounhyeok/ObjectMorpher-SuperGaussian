@@ -94,7 +94,18 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
 
 
 class LapDeform(nn.Module):
-    def __init__(self, init_pcl, K=4, trajectory=None, node_radius=None, num_iter=3):
+    def __init__(
+        self,
+        init_pcl,
+        K=4,
+        trajectory=None,
+        node_radius=None,
+        num_iter=3,
+        graph_radius=None,
+        connectivity_mode='nn',
+        graph_k=4,
+        least_edge_num=3,
+    ):
         super().__init__()
         self.K = K
         self.N = init_pcl.shape[0]
@@ -110,34 +121,42 @@ class LapDeform(nn.Module):
         self.mask_control_points = False
         if self.mask_control_points:
             self.generate_mask_init_pcl()
-            radius = torch.linalg.norm(self.init_pcl_reduced.max(dim=0).values - self.init_pcl_reduced.min(dim=0).values) / 10 * 3
+            radius = graph_radius
+            if radius is None:
+                radius = torch.linalg.norm(self.init_pcl_reduced.max(dim=0).values - self.init_pcl_reduced.min(dim=0).values) / 10 * 3
             print("Set ball query radius to %f" % radius.item())
             try:
                 self.arap_deformer = ARAPDeformer(
                     self.init_pcl_reduced, radius=radius, K=30, point_mask=self.init_pcl_mask,
-                    trajectory=trajectory, node_radius=node_radius, num_iter=num_iter
+                    trajectory=trajectory, node_radius=node_radius, num_iter=num_iter,
+                    connectivity_mode=connectivity_mode, graph_k=graph_k, least_edge_num=least_edge_num
                 )
             except TypeError as e:
                 if "num_iter" in str(e):
                     print("[LapDeform] ARAPDeformer does not support `num_iter`, fallback without it.")
                     self.arap_deformer = ARAPDeformer(
                         self.init_pcl_reduced, radius=radius, K=30, point_mask=self.init_pcl_mask,
-                        trajectory=trajectory, node_radius=node_radius
+                        trajectory=trajectory, node_radius=node_radius,
+                        connectivity_mode=connectivity_mode, graph_k=graph_k, least_edge_num=least_edge_num
                     )
                 else:
                     raise
         else:
-            radius = torch.linalg.norm(self.init_pcl.max(dim=0).values - self.init_pcl.min(dim=0).values) / 8
+            radius = graph_radius
+            if radius is None:
+                radius = torch.linalg.norm(self.init_pcl.max(dim=0).values - self.init_pcl.min(dim=0).values) / 8
             print("Set ball query radius to %f" % radius.item())
             try:
                 self.arap_deformer = ARAPDeformer(
-                    init_pcl, radius=radius, K=16, trajectory=trajectory, node_radius=node_radius, num_iter=num_iter
+                    init_pcl, radius=radius, K=16, trajectory=trajectory, node_radius=node_radius, num_iter=num_iter,
+                    connectivity_mode=connectivity_mode, graph_k=graph_k, least_edge_num=least_edge_num
                 )
             except TypeError as e:
                 if "num_iter" in str(e):
                     print("[LapDeform] ARAPDeformer does not support `num_iter`, fallback without it.")
                     self.arap_deformer = ARAPDeformer(
-                        init_pcl, radius=radius, K=16, trajectory=trajectory, node_radius=node_radius
+                        init_pcl, radius=radius, K=16, trajectory=trajectory, node_radius=node_radius,
+                        connectivity_mode=connectivity_mode, graph_k=graph_k, least_edge_num=least_edge_num
                     )
                 else:
                     raise
@@ -256,4 +275,3 @@ def lstsq_with_handles(A, b, handle_idx, handle_pos):
     x_out[handle_idx] = handle_pos
     x_out[handle_mask.logical_not()] = x
     return x_out
-

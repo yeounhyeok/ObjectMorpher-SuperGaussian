@@ -66,7 +66,7 @@ def cal_connectivity_from_points(points=None, radius=0.1, K=10, trajectory=None,
         if mode == 'floyd':
             dist_mat = geodesic_distance_floyd(points, K=GraphK)
             dist_mat = dist_mat ** 2
-            mask = torch.eye(Nv).bool()
+            mask = torch.eye(Nv, dtype=torch.bool, device=dist_mat.device)
             dist_mat[mask] = torch.inf
             nn_dist, nn_idx = dist_mat.sort(dim=1)
             nn_dist, nn_idx = nn_dist[:, :K], nn_idx[:, :K]
@@ -79,7 +79,7 @@ def cal_connectivity_from_points(points=None, radius=0.1, K=10, trajectory=None,
         if mode == 'floyd':
             dist_mat = geodesic_distance_floyd(trajectory, K=GraphK)
             dist_mat = dist_mat ** 2
-            mask = torch.eye(Nv).bool()
+            mask = torch.eye(Nv, dtype=torch.bool, device=dist_mat.device)
             dist_mat[mask] = torch.inf
             nn_dist, nn_idx = dist_mat.sort(dim=1)
             nn_dist, nn_idx = nn_dist[:, :K], nn_idx[:, :K]

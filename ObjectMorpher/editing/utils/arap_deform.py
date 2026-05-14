@@ -36,7 +36,18 @@ def mask_softmax(x, mask, dim=1):
 
 
 class ARAPDeformer:
-    def __init__(self, verts, K=10, radius=0.3, point_mask=None, trajectory=None, node_radius=None) -> None:
+    def __init__(
+        self,
+        verts,
+        K=10,
+        radius=0.3,
+        point_mask=None,
+        trajectory=None,
+        node_radius=None,
+        connectivity_mode='nn',
+        graph_k=4,
+        least_edge_num=3,
+    ) -> None:
         # verts: (N, 3), one_ring_idx: (N, K)
         self.device = verts.device
         self.verts = verts
@@ -45,7 +56,16 @@ class ARAPDeformer:
         self.K = K
         self.N = len(verts)
 
-        self.ii, self.jj, self.nn, weight = cal_connectivity_from_points(self.verts, self.radius, self.K, trajectory=trajectory, node_radius=node_radius)
+        self.ii, self.jj, self.nn, weight = cal_connectivity_from_points(
+            self.verts,
+            self.radius,
+            self.K,
+            trajectory=trajectory,
+            node_radius=node_radius,
+            mode=connectivity_mode,
+            GraphK=graph_k,
+            least_edge_num=least_edge_num,
+        )
         self.L = cal_laplacian(Nv=self.N, ii=self.ii, jj=self.jj, nn=self.nn)
         # self.L = cal_L_from_points(points=self.verts)
 

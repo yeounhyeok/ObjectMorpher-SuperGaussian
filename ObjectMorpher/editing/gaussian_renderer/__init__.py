@@ -12,7 +12,6 @@
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.rigid_utils import from_homogenous, to_homogenous
 
@@ -46,7 +45,7 @@ def quaternion_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return standardize_quaternion(ab)
 
 
-def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, d_opacity=None, d_color=None, scaling_modifier=1.0, override_color=None, random_bg_color=False, render_motion=False, detach_xyz=False, detach_scale=False, detach_rot=False, detach_opacity=False, d_rot_as_res=True, scale_const=None, d_rotation_bias=None, force_visible=False):
+def render(viewpoint_camera, pc, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, d_opacity=None, d_color=None, scaling_modifier=1.0, override_color=None, random_bg_color=False, render_motion=False, detach_xyz=False, detach_scale=False, detach_rot=False, detach_opacity=False, d_rot_as_res=True, scale_const=None, d_rotation_bias=None, force_visible=False):
     """
     Render the scene. 
     
@@ -168,7 +167,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
 
 
 def render_flow(
-    pc: GaussianModel,
+    pc,
     viewpoint_camera1,
     viewpoint_camera2,
     d_xyz1, d_xyz2,

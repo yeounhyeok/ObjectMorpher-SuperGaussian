@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime
+import shutil
 
 import importlib
 import importlib.util
@@ -42,18 +43,46 @@ def _load_module(module_name: str, file_path: Path):
     return module
 
 
-pixelhacker_utils = _load_module("pixelhacker_utils", INPAINTING_DIR / "utils.py")
-pixelhacker_pipeline_mod = _load_module("pixelhacker_pipeline", INPAINTING_DIR / "pipeline.py")
+pixelhacker_utils = None
+pixelhacker_pipeline_mod = None
 trellis_pipelines_mod = None
 trellis_utils_mod = None
+DDIMScheduler = None
+SimplifiedSAMProcessor = None
 
-from preprocess.sam_processor import SimplifiedSAMProcessor  # noqa: E402
-from diffusers import DDIMScheduler  # noqa: E402
+from editing.utils.pseudo_multiview_utils import prepare_pseudo_multiview_lifting  # noqa: E402
+from editing.utils.scene_lifting_utils import extract_sharp_scene_metadata  # noqa: E402
 
-build_model = pixelhacker_utils.build_model
-build_vae = pixelhacker_utils.build_vae
-load_cfg = pixelhacker_utils.load_cfg
-PixelHacker_Pipeline = pixelhacker_pipeline_mod.PixelHacker_Pipeline
+build_model = None
+build_vae = None
+load_cfg = None
+PixelHacker_Pipeline = None
+
+
+def _ensure_sam_processor_cls():
+    global SimplifiedSAMProcessor
+    if SimplifiedSAMProcessor is None:
+        from preprocess.sam_processor import SimplifiedSAMProcessor as sam_processor_cls
+
+        SimplifiedSAMProcessor = sam_processor_cls
+    return SimplifiedSAMProcessor
+
+
+def _ensure_pixelhacker_modules() -> None:
+    global pixelhacker_utils, pixelhacker_pipeline_mod, DDIMScheduler
+    global build_model, build_vae, load_cfg, PixelHacker_Pipeline
+    if DDIMScheduler is None:
+        from diffusers import DDIMScheduler as ddim_scheduler_cls
+
+        DDIMScheduler = ddim_scheduler_cls
+    if pixelhacker_utils is None:
+        pixelhacker_utils = _load_module("pixelhacker_utils", INPAINTING_DIR / "utils.py")
+    if pixelhacker_pipeline_mod is None:
+        pixelhacker_pipeline_mod = _load_module("pixelhacker_pipeline", INPAINTING_DIR / "pipeline.py")
+    build_model = pixelhacker_utils.build_model
+    build_vae = pixelhacker_utils.build_vae
+    load_cfg = pixelhacker_utils.load_cfg
+    PixelHacker_Pipeline = pixelhacker_pipeline_mod.PixelHacker_Pipeline
 
 
 def _ensure_trellis_modules() -> None:
@@ -74,10 +103,16 @@ class PixelHackerRunner:
         device: str = "cuda",
         release_after_run: bool = False,
     ) -> None:
+        _ensure_pixelhacker_modules()
         requested_device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.target_device = requested_device
         self.release_after_run = release_after_run
         self.config = load_cfg(str(config_path))
+        vae_dir = self.config.get("vae", {}).get("model_dir")
+        if vae_dir:
+            vae_path = Path(vae_dir)
+            if not vae_path.is_absolute() and not vae_path.exists():
+                self.config["vae"]["model_dir"] = str(INPAINTING_DIR / vae_path)
 
         # Build diffusion model and load weights
         self.model = build_model(self.config, 20).to("cpu")
@@ -143,6 +178,7 @@ class PixelHackerRunner:
         strength: float = 0.999,
         guidance_scale: float = 4.5,
         noise_offset: Optional[float] = 0.0357,
+        paste: bool = False,
     ) -> Path:
         self._prepare_for_run()
         image = Image.open(image_path).convert("RGB")
@@ -156,7 +192,7 @@ class PixelHackerRunner:
             strength=strength,
             guidance_scale=guidance_scale,
             noise_offset=noise_offset,
-            paste=False,
+            paste=paste,
             mute=False,
         )[0]
 
@@ -303,6 +339,88 @@ class TrellisRunner:
             torch.cuda.empty_cache()
 
         return {"directory": run_dir, "ply": ply_path, "glb": glb_path}
+
+
+class SharpRunner:
+    """Shells out to Apple's SHARP CLI and preserves camera metadata as JSON."""
+
+    def __init__(
+        self,
+        sharp_bin: str,
+        checkpoint_path: Optional[str] = None,
+        device: str = "default",
+    ) -> None:
+        self.sharp_bin = sharp_bin
+        self.checkpoint_path = checkpoint_path
+        self.device = device
+
+    def _find_output_ply(self, run_dir: Path, image_path: Path) -> Path:
+        expected = run_dir / f"{image_path.stem}.ply"
+        if expected.exists():
+            return expected
+        ply_files = sorted(run_dir.glob("*.ply"))
+        if not ply_files:
+            raise FileNotFoundError(f"SHARP did not create a PLY file in {run_dir}")
+        return ply_files[0]
+
+    def run(self, image_path: Path, output_root: Path) -> Dict[str, Path]:
+        if shutil.which(self.sharp_bin) is None and not Path(self.sharp_bin).exists():
+            raise FileNotFoundError(f"SHARP executable not found: {self.sharp_bin}")
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = output_root / f"{image_path.stem}_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        command = [
+            self.sharp_bin,
+            "predict",
+            "-i",
+            str(image_path),
+            "-o",
+            str(run_dir),
+        ]
+        if self.device and self.device != "default":
+            command.extend(["--device", self.device])
+        if self.checkpoint_path:
+            command.extend(["-c", self.checkpoint_path])
+
+        completed = subprocess.run(command, cwd=str(REPO_ROOT), text=True, capture_output=True)
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            stdout = completed.stdout.strip()
+            detail = stderr or stdout or f"exit code {completed.returncode}"
+            raise RuntimeError(f"SHARP prediction failed: {detail}")
+
+        ply_path = self._find_output_ply(run_dir, image_path)
+        meta_path = run_dir / "scene_meta.json"
+        extract_sharp_scene_metadata(ply_path, meta_path, image_path)
+        return {"directory": run_dir, "ply": ply_path, "scene_meta": meta_path}
+
+
+class PseudoMultiviewRunner:
+    """Runs or imports ExScene/CAT3D-style pseudo multiview outputs."""
+
+    def __init__(
+        self,
+        generator_command: str = "",
+        reconstruction_command: str = "",
+        import_dir: Optional[str] = None,
+        explicit_ply: Optional[str] = None,
+    ) -> None:
+        self.generator_command = generator_command
+        self.reconstruction_command = reconstruction_command
+        self.import_dir = import_dir
+        self.explicit_ply = explicit_ply
+
+    def run(self, image_path: Path, output_root: Path) -> Dict[str, Path]:
+        return prepare_pseudo_multiview_lifting(
+            image_path=image_path,
+            output_root=output_root,
+            generator_command=self.generator_command,
+            reconstruction_command=self.reconstruction_command,
+            import_dir=self.import_dir,
+            explicit_ply=self.explicit_ply,
+        )
 
 
 class ObjectPlacementTool:
@@ -605,22 +723,26 @@ class WorkflowGUI:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.lifting_backend = args.lifting_backend
         self.sam_output_dir = Path(args.output_dir) / "sam"
         self.inpaint_output_dir = Path(args.output_dir) / "pixelhacker"
         self.trellis_output_dir = Path(args.trellis_output_dir)
+        self.sharp_output_dir = Path(args.sharp_output_dir)
+        self.pseudo_mv_output_dir = Path(args.pseudo_mv_output_dir)
+        self.scgs_model_path = Path(args.output_dir) / "scgs"
+        self.refined_output_dir = Path(args.output_dir) / "diffusion_prior"
         self.sam_output_dir.mkdir(parents=True, exist_ok=True)
         self.inpaint_output_dir.mkdir(parents=True, exist_ok=True)
         self.trellis_output_dir.mkdir(parents=True, exist_ok=True)
+        self.sharp_output_dir.mkdir(parents=True, exist_ok=True)
+        self.pseudo_mv_output_dir.mkdir(parents=True, exist_ok=True)
+        self.scgs_model_path.mkdir(parents=True, exist_ok=True)
+        self.refined_output_dir.mkdir(parents=True, exist_ok=True)
 
         self.sam_processor: Optional[SimplifiedSAMProcessor] = None
         self.sam_release_gpu = args.sam_release_gpu
         self.pixelhacker_release_gpu = args.pixelhacker_release_gpu
-        self.pixelhacker = PixelHackerRunner(
-            config_path=Path(args.pixelhacker_config),
-            weight_path=Path(args.pixelhacker_weight),
-            device=args.device,
-            release_after_run=self.pixelhacker_release_gpu,
-        )
+        self.pixelhacker: Optional[PixelHackerRunner] = None
         self.trellis_runner = TrellisRunner(
             model_id=args.trellis_model,
             device=args.trellis_device,
@@ -629,9 +751,20 @@ class WorkflowGUI:
             default_seed=args.trellis_seed,
             offline_mode=args.trellis_offline,
         )
+        self.sharp_runner = SharpRunner(
+            sharp_bin=args.sharp_bin,
+            checkpoint_path=args.sharp_checkpoint,
+            device=args.sharp_device,
+        )
+        self.pseudo_mv_runner = PseudoMultiviewRunner(
+            generator_command=args.pseudo_mv_command,
+            reconstruction_command=args.pseudo_mv_reconstruction_command,
+            import_dir=args.pseudo_mv_import_dir,
+            explicit_ply=args.pseudo_mv_ply,
+        )
         self.trellis_release_gpu = args.trellis_release_gpu
         self.trellis_preload = args.trellis_preload
-        self.trellis_ready = not self.trellis_preload
+        self.trellis_ready = not self.trellis_preload or self.lifting_backend != "trellis"
         self.scgs_script = Path(args.scgs_script)
         self.scgs_width = args.scgs_width
         self.scgs_height = args.scgs_height
@@ -639,21 +772,27 @@ class WorkflowGUI:
 
         self.source_image: Optional[Path] = None
         self.sam_results: Optional[Dict[str, str]] = None
+        self.sharp_result: Optional[Dict[str, Path]] = None
+        self.pseudo_mv_result: Optional[Dict[str, Path]] = None
         self.inpaint_result: Optional[Path] = None
         self.trellis_result: Optional[Dict[str, Path]] = None
         self.scgs_process: Optional[subprocess.Popen] = None
         self.composite_result: Optional[Path] = None
+        self.refined_result: Optional[Path] = None
 
         self.log_messages = []
         self.pixelhacker_running = False
         self.trellis_running = False
+        self.sharp_running = False
+        self.pseudo_mv_running = False
+        self.diffusion_prior_running = False
         self._event_queue = queue.Queue()
 
         dpg.create_context()
         self.object_tool = ObjectPlacementTool(self)
         self._build_ui()
 
-        if self.trellis_preload:
+        if self.trellis_preload and self.lifting_backend == "trellis":
             self._log("[Trellis] Preloading pipeline in background...")
             threading.Thread(target=self._preload_trellis, daemon=True).start()
             dpg.configure_item("run_trellis_button", enabled=False)
@@ -674,22 +813,35 @@ class WorkflowGUI:
 
             dpg.add_separator()
 
-            dpg.add_text("Step 3 - PixelHacker Background Fill")
+            dpg.add_text("Step 3 - SHARP Full-Scene 3DGS Lifting")
+            dpg.add_button(label="Run SHARP Full Scene", tag="run_sharp_button", callback=self._handle_run_sharp)
+            dpg.add_text("SHARP Output: none", tag="sharp_output_text")
+            dpg.add_button(label="Run Pseudo-MV Full Scene", tag="run_pseudo_mv_button", callback=self._handle_run_pseudo_mv)
+            dpg.add_text("Pseudo-MV Output: none", tag="pseudo_mv_output_text")
+
+            dpg.add_separator()
+
+            dpg.add_text("Legacy - PixelHacker Background Fill")
             dpg.add_button(label="Run PixelHacker", tag="run_pixelhacker_button", callback=self._handle_run_pixelhacker)
             dpg.add_text("Inpaint Result: none", tag="pixelhacker_output_text")
 
             dpg.add_separator()
-            dpg.add_text("Step 4 - Trellis 3D Reconstruction")
+            dpg.add_text("Legacy - Trellis Object Reconstruction")
             dpg.add_button(label="Run Trellis", tag="run_trellis_button", callback=self._handle_run_trellis)
             dpg.add_text("Trellis Output: none", tag="trellis_output_text")
 
             dpg.add_separator()
-            dpg.add_text("Step 5 - SC-GS Editing")
+            dpg.add_text("Step 4 - SC-GS Editing")
             dpg.add_button(label="Open SC-GS Editor", tag="open_scgs_button", callback=self._handle_open_scgs)
             dpg.add_text("SC-GS Status: idle", tag="scgs_status_text")
 
             dpg.add_separator()
-            dpg.add_text("Step 6 - Object Reprojection")
+            dpg.add_text("Step 5 - ARAP-GS Diffusion Prior")
+            dpg.add_button(label="Run Diffusion Prior Fine-Tune", tag="run_diffusion_prior_button", callback=self._handle_run_diffusion_prior)
+            dpg.add_text("Refined PLY: none", tag="refined_output_text")
+
+            dpg.add_separator()
+            dpg.add_text("Legacy - Object Reprojection")
             dpg.add_button(label="Open Object Placement Tool", tag="open_object_tool_button", callback=self._handle_open_object_tool)
             dpg.add_text("Composite Result: none", tag="composite_result_text")
 
@@ -700,6 +852,7 @@ class WorkflowGUI:
                 dpg.add_button(label="Load Object PNG", callback=lambda: dpg.show_item("object_file_dialog"))
                 dpg.add_button(label="Load Background Image", callback=lambda: dpg.show_item("background_file_dialog"))
                 dpg.add_button(label="Load Trellis PLY", callback=lambda: dpg.show_item("ply_file_dialog"))
+                dpg.add_button(label="Load Scene Meta", callback=lambda: dpg.show_item("scene_meta_file_dialog"))
 
             dpg.add_separator()
             dpg.add_text("Console Log")
@@ -760,6 +913,17 @@ class WorkflowGUI:
         ):
             dpg.add_file_extension("PLY{.ply}")
 
+        with dpg.file_dialog(
+            directory_selector=False,
+            show=False,
+            callback=self._on_scene_meta_selected,
+            file_count=1,
+            tag="scene_meta_file_dialog",
+            width=700,
+            height=400,
+        ):
+            dpg.add_file_extension("JSON{.json}")
+
     def _log(self, message: str) -> None:
         print(message)
         self.log_messages.append(message)
@@ -788,7 +952,8 @@ class WorkflowGUI:
             self._log(f"[SAM] Checkpoint not found: {checkpoint}")
             return
         self._log("[SAM] Loading model, please wait...")
-        self.sam_processor = SimplifiedSAMProcessor(
+        sam_processor_cls = _ensure_sam_processor_cls()
+        self.sam_processor = sam_processor_cls(
             checkpoint_path=str(checkpoint),
             output_base_dir=str(self.sam_output_dir),
         )
@@ -809,6 +974,45 @@ class WorkflowGUI:
             torch.cuda.empty_cache()
         self._log("[SAM] GPU resources released.")
 
+    def _ensure_pixelhacker(self) -> bool:
+        if self.pixelhacker is not None:
+            return True
+        config_path = Path(self.args.pixelhacker_config)
+        weight_path = Path(self.args.pixelhacker_weight)
+        if not config_path.exists():
+            self._log(f"[PixelHacker] Config not found: {config_path}")
+            return False
+        if not weight_path.exists():
+            self._log(f"[PixelHacker] Weight not found: {weight_path}")
+            return False
+        self._log("[PixelHacker] Loading model, please wait...")
+        self.pixelhacker = PixelHackerRunner(
+            config_path=config_path,
+            weight_path=weight_path,
+            device=self.args.device,
+            release_after_run=self.pixelhacker_release_gpu,
+        )
+        self._log("[PixelHacker] Ready.")
+        return True
+
+    def _active_lifting_result(self) -> Optional[Dict[str, Path]]:
+        if self.lifting_backend == "sharp":
+            return self.sharp_result
+        if self.lifting_backend in {"pseudo-mv", "exscene", "cat3d"}:
+            return self.pseudo_mv_result
+        return self.trellis_result
+
+    def _latest_scgs_edit(self) -> Optional[Path]:
+        edit_files = sorted(self.scgs_model_path.glob("edit_*.ply"), key=lambda p: p.stat().st_mtime)
+        return edit_files[-1] if edit_files else None
+
+    def _latest_scgs_edit_state(self, edit_ply: Path) -> Optional[Path]:
+        state_path = edit_ply.with_suffix(".edit_state.npz")
+        if state_path.exists():
+            return state_path
+        state_files = sorted(self.scgs_model_path.glob("edit_*.edit_state.npz"), key=lambda p: p.stat().st_mtime)
+        return state_files[-1] if state_files else None
+
     # ----------------------------- Callbacks -----------------------------
     def _on_image_selected(self, sender, app_data) -> None:  # noqa: D401 - DearPyGUI signature
         for display_name, file_path in app_data["selections"].items():
@@ -816,13 +1020,19 @@ class WorkflowGUI:
             dpg.set_value("selected_image_text", display_name)
             self._log(f"[Input] Image selected: {file_path}")
             self.sam_results = None
+            self.sharp_result = None
+            self.pseudo_mv_result = None
             self.inpaint_result = None
             self.trellis_result = None
             self.composite_result = None
+            self.refined_result = None
             dpg.set_value("sam_mask_text", "Mask: none")
+            dpg.set_value("sharp_output_text", "SHARP Output: none")
+            dpg.set_value("pseudo_mv_output_text", "Pseudo-MV Output: none")
             dpg.set_value("pixelhacker_output_text", "Inpaint Result: none")
             dpg.set_value("trellis_output_text", "Trellis Output: none")
             dpg.set_value("composite_result_text", "Composite Result: none")
+            dpg.set_value("refined_output_text", "Refined PLY: none")
             break
 
     def _on_mask_selected(self, sender, app_data) -> None:  # noqa: D401 - DearPyGUI signature
@@ -879,8 +1089,38 @@ class WorkflowGUI:
                 "ply": ply_path,
                 "glb": None,
             }
+            if self.lifting_backend in {"sharp", "pseudo-mv", "exscene", "cat3d"}:
+                result = {
+                    "directory": ply_path.parent,
+                    "ply": ply_path,
+                    "scene_meta": ply_path.parent / "scene_meta.json",
+                }
+                if self.lifting_backend == "sharp":
+                    self.sharp_result = result
+                    dpg.set_value("sharp_output_text", f"SHARP Output: {ply_path}")
+                else:
+                    self.pseudo_mv_result = result
+                    dpg.set_value("pseudo_mv_output_text", f"Pseudo-MV Output: {ply_path}")
             dpg.set_value("trellis_output_text", f"Trellis Output: {ply_path}")
             self._log(f"[Trellis] Using existing PLY: {file_path}")
+            break
+
+    def _on_scene_meta_selected(self, sender, app_data) -> None:  # noqa: D401
+        for _, file_path in app_data["selections"].items():
+            meta_path = Path(file_path)
+            if not meta_path.exists():
+                self._log(f"[SHARP] Scene metadata file not found: {file_path}")
+                break
+            if self.lifting_backend in {"pseudo-mv", "exscene", "cat3d"}:
+                self.pseudo_mv_result = self.pseudo_mv_result or {"directory": meta_path.parent, "ply": None}
+                self.pseudo_mv_result["scene_meta"] = meta_path
+                dpg.set_value("pseudo_mv_output_text", f"Pseudo-MV Meta: {meta_path}")
+                self._log(f"[Pseudo-MV] Using existing scene metadata: {file_path}")
+            else:
+                self.sharp_result = self.sharp_result or {"directory": meta_path.parent, "ply": None}
+                self.sharp_result["scene_meta"] = meta_path
+                dpg.set_value("sharp_output_text", f"SHARP Meta: {meta_path}")
+                self._log(f"[SHARP] Using existing scene metadata: {file_path}")
             break
 
     def _handle_run_sam(self) -> None:
@@ -906,6 +1146,47 @@ class WorkflowGUI:
         if self.sam_release_gpu:
             self._release_sam()
 
+    def _handle_run_sharp(self) -> None:
+        if self.source_image is None:
+            self._log("[SHARP] Please select an input image first.")
+            return
+        if self.sharp_running:
+            self._log("[SHARP] A lifting job is already running. Please wait...")
+            return
+        if self.pixelhacker is not None and self.pixelhacker_release_gpu:
+            self.pixelhacker.release()
+        if self.trellis_runner.pipeline is not None:
+            self.trellis_runner.release()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.sharp_running = True
+        dpg.configure_item("run_sharp_button", enabled=False)
+        self._log("[SHARP] Generating full-scene 3D Gaussian splats...")
+        threading.Thread(target=self._sharp_worker, args=(self.source_image,), daemon=True).start()
+
+    def _handle_run_pseudo_mv(self) -> None:
+        if self.source_image is None:
+            self._log("[Pseudo-MV] Please select an input image first.")
+            return
+        if self.pseudo_mv_running:
+            self._log("[Pseudo-MV] A lifting job is already running. Please wait...")
+            return
+        if not self.args.pseudo_mv_import_dir and not self.args.pseudo_mv_command:
+            self._log("[Pseudo-MV] Configure --pseudo-mv-command or --pseudo-mv-import-dir first.")
+            return
+        if self.pixelhacker is not None and self.pixelhacker_release_gpu:
+            self.pixelhacker.release()
+        if self.trellis_runner.pipeline is not None:
+            self.trellis_runner.release()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.pseudo_mv_running = True
+        dpg.configure_item("run_pseudo_mv_button", enabled=False)
+        self._log("[Pseudo-MV] Generating/importing pseudo multiview full-scene 3DGS...")
+        threading.Thread(target=self._pseudo_mv_worker, args=(self.source_image,), daemon=True).start()
+
     def _handle_run_pixelhacker(self) -> None:
         if self.source_image is None:
             self._log("[PixelHacker] Please select an input image first.")
@@ -916,6 +1197,9 @@ class WorkflowGUI:
 
         if self.pixelhacker_running:
             self._log("[PixelHacker] A job is already running. Please wait...")
+            return
+
+        if not self._ensure_pixelhacker() or self.pixelhacker is None:
             return
 
         mask_path = Path(self.sam_results["mask"])
@@ -952,7 +1236,7 @@ class WorkflowGUI:
             self._log("[Trellis] A generation job is already running. Please wait...")
             return
 
-        if self.pixelhacker_release_gpu:
+        if self.pixelhacker_release_gpu and self.pixelhacker is not None:
             self.pixelhacker.release()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -972,20 +1256,34 @@ class WorkflowGUI:
         if self.scgs_process and self.scgs_process.poll() is None:
             self._log("[SC-GS] Editor already running. Close it before launching again.")
             return
-        if not self.trellis_result or not self.trellis_result.get("ply"):
-            self._log("[SC-GS] Please run Trellis to generate a PLY file first.")
+        lifting_result = self._active_lifting_result()
+        if not lifting_result or not lifting_result.get("ply"):
+            backend_name = {
+                "sharp": "SHARP",
+                "trellis": "Trellis",
+                "pseudo-mv": "Pseudo-MV",
+                "exscene": "ExScene",
+                "cat3d": "CAT3D",
+            }.get(self.lifting_backend, self.lifting_backend)
+            self._log(f"[SC-GS] Please run {backend_name} to generate a PLY file first.")
             return
 
-        ply_path = self.trellis_result.get("ply")
+        ply_path = lifting_result.get("ply")
         if ply_path is None or not Path(ply_path).exists():
             self._log(f"[SC-GS] PLY file not found: {ply_path}")
             return
+        mask_path = None
+        if self.sam_results and self.sam_results.get("mask"):
+            mask_path = Path(self.sam_results["mask"])
+            if not mask_path.exists():
+                self._log(f"[SC-GS] Mask file not found: {mask_path}")
+                return
 
         # Release Trellis resources before launching SC-GS to ensure free GPU memory
         if self.trellis_runner.pipeline is not None:
             self._log("[SC-GS] Releasing Trellis pipeline before launch.")
             self.trellis_runner.release()
-            if self.trellis_preload:
+            if self.trellis_preload and self.lifting_backend == "trellis":
                 self.trellis_ready = False
                 dpg.configure_item("run_trellis_button", enabled=False)
                 threading.Thread(target=self._preload_trellis, daemon=True).start()
@@ -1000,7 +1298,23 @@ class WorkflowGUI:
             str(self.scgs_width),
             "--H",
             str(self.scgs_height),
+            "--model_path",
+            str(self.scgs_model_path),
         ]
+        if self.source_image is not None:
+            command.extend(["--source-image", str(self.source_image)])
+        scene_meta = lifting_result.get("scene_meta")
+        scene_meta_exists = scene_meta is not None and Path(scene_meta).exists()
+        needs_scene_meta = self.lifting_backend in {"sharp", "pseudo-mv", "exscene", "cat3d"}
+        if mask_path is not None and needs_scene_meta and not scene_meta_exists:
+            self._log("[SC-GS] Scene metadata is required for object-mask projection. Load scene_meta.json first.")
+            return
+        if mask_path is not None and scene_meta_exists:
+            command.extend(["--edit-mask", str(mask_path), "--mask-mode", "object"])
+        if scene_meta_exists:
+            command.extend(["--scene-meta", str(scene_meta)])
+        if needs_scene_meta:
+            command.append("--save-edit-state")
         if self.scgs_white_background:
             command.append("--white_background")
 
@@ -1030,6 +1344,44 @@ class WorkflowGUI:
         self._log(f"[Compose] 打开合成工具，背景: {self.inpaint_result}")
         self.object_tool.open(self.inpaint_result)
 
+    def _handle_run_diffusion_prior(self) -> None:
+        if self.diffusion_prior_running:
+            self._log("[DiffusionPrior] A fine-tuning job is already running. Please wait...")
+            return
+        if self.source_image is None:
+            self._log("[DiffusionPrior] Please select an input image first.")
+            return
+        if not self.sam_results or not self.sam_results.get("mask"):
+            self._log("[DiffusionPrior] Please run or load a SAM mask first.")
+            return
+        lifting_result = self._active_lifting_result()
+        if not lifting_result or not lifting_result.get("scene_meta"):
+            self._log("[DiffusionPrior] Scene metadata is required. Run SHARP or load scene_meta.json.")
+            return
+        scene_meta = Path(lifting_result["scene_meta"])
+        if not scene_meta.exists():
+            self._log(f"[DiffusionPrior] Scene metadata file not found: {scene_meta}")
+            return
+        edit_ply = self._latest_scgs_edit()
+        if edit_ply is None:
+            self._log(f"[DiffusionPrior] No edited PLY found under {self.scgs_model_path}. Save from SC-GS first.")
+            return
+        mask_path = Path(self.sam_results["mask"])
+        if not mask_path.exists():
+            self._log(f"[DiffusionPrior] Mask file not found: {mask_path}")
+            return
+        edit_state = self._latest_scgs_edit_state(edit_ply)
+
+        self.diffusion_prior_running = True
+        dpg.configure_item("run_diffusion_prior_button", enabled=False)
+        dpg.set_value("refined_output_text", "Refined PLY: running...")
+        self._log(f"[DiffusionPrior] Fine-tuning 3DGS appearance from {edit_ply}")
+        threading.Thread(
+            target=self._diffusion_prior_worker,
+            args=(edit_ply, self.source_image, mask_path, scene_meta, edit_state),
+            daemon=True,
+        ).start()
+
     def _wait_for_scgs(self, process: subprocess.Popen) -> None:
         try:
             return_code = process.wait()
@@ -1039,21 +1391,95 @@ class WorkflowGUI:
             return
         self._enqueue_event("scgs_exit", return_code)
 
+    def _sharp_worker(self, image_path: Path) -> None:
+        try:
+            result = self.sharp_runner.run(image_path=image_path, output_root=self.sharp_output_dir)
+        except Exception as exc:  # pragma: no cover - runtime diagnostics
+            self._log_threadsafe(f"[SHARP] Lifting failed: {exc}")
+            self._enqueue_event("sharp_error", str(exc))
+            return
+        self._enqueue_event("sharp_done", {k: str(v) for k, v in result.items()})
+
+    def _pseudo_mv_worker(self, image_path: Path) -> None:
+        try:
+            result = self.pseudo_mv_runner.run(image_path=image_path, output_root=self.pseudo_mv_output_dir)
+        except Exception as exc:  # pragma: no cover - runtime diagnostics
+            self._log_threadsafe(f"[Pseudo-MV] Lifting failed: {exc}")
+            self._enqueue_event("pseudo_mv_error", str(exc))
+            return
+        self._enqueue_event("pseudo_mv_done", {k: str(v) for k, v in result.items()})
+
     def _pixelhacker_worker(self, image_path: Path, mask_path: Path, output_path: Path) -> None:
         try:
+            if self.pixelhacker is None:
+                raise RuntimeError("PixelHacker runner is not initialized")
             result_path = self.pixelhacker.run(
                 image_path=image_path,
                 mask_path=mask_path,
                 output_path=output_path,
             )
         except Exception as exc:  # pragma: no cover - runtime diagnostics
-            if self.pixelhacker_release_gpu:
+            if self.pixelhacker_release_gpu and self.pixelhacker is not None:
                 self.pixelhacker.release()
             self._log_threadsafe(f"[PixelHacker] Inpainting failed: {exc}")
             self._enqueue_event("pixelhacker_error", str(exc))
             return
 
         self._enqueue_event("pixelhacker_done", str(result_path))
+
+    def _diffusion_prior_worker(
+        self,
+        gs_path: Path,
+        source_image: Path,
+        mask_path: Path,
+        scene_meta: Path,
+        edit_state: Optional[Path],
+    ) -> None:
+        command = [
+            sys.executable,
+            "-m",
+            "editing.diffusion_prior_finetune",
+            "--gs-path",
+            str(gs_path),
+            "--source-image",
+            str(source_image),
+            "--edit-mask",
+            str(mask_path),
+            "--scene-meta",
+            str(scene_meta),
+            "--out-dir",
+            str(self.refined_output_dir),
+            "--iterations",
+            str(self.args.diffusion_prior_iterations),
+            "--stable-sr-root",
+            str(self.args.stable_sr_root),
+            "--stable-sr-env",
+            str(self.args.stable_sr_env),
+        ]
+        if self.args.stable_sr_command:
+            command.extend(["--stable-sr-command", self.args.stable_sr_command])
+        if self.args.stable_sr_worker_command:
+            command.extend(["--stable-sr-worker-command", self.args.stable_sr_worker_command])
+        if edit_state is not None:
+            command.extend(["--edit-state", str(edit_state)])
+        if self.args.diffusion_prior_stub:
+            command.append("--stable-sr-stub")
+
+        completed = subprocess.run(command, cwd=str(REPO_ROOT), text=True, capture_output=True)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            self._log_threadsafe(f"[DiffusionPrior] Fine-tuning failed: {detail}")
+            self._enqueue_event("diffusion_prior_error", detail)
+            return
+
+        output_path = None
+        for line in completed.stdout.splitlines():
+            if line.startswith("REFINED_PLY="):
+                output_path = line.split("=", 1)[1].strip()
+        if output_path is None:
+            refined_files = sorted(self.refined_output_dir.glob("*.ply"), key=lambda p: p.stat().st_mtime)
+            output_path = str(refined_files[-1]) if refined_files else ""
+        self._enqueue_event("diffusion_prior_done", output_path)
 
     def _trellis_worker(self, object_path: Path) -> None:
         release_requested = self.trellis_release_gpu
@@ -1095,6 +1521,40 @@ class WorkflowGUI:
                 self.pixelhacker_running = False
                 dpg.configure_item("run_pixelhacker_button", enabled=True)
                 self._log(f"[PixelHacker] Inpainting failed: {payload}")
+            elif event_type == "sharp_done" and isinstance(payload, dict):
+                self.sharp_running = False
+                dpg.configure_item("run_sharp_button", enabled=True)
+                dir_path = payload.get("directory")
+                ply_path = payload.get("ply")
+                scene_meta = payload.get("scene_meta")
+                self.sharp_result = {
+                    "directory": Path(dir_path) if dir_path else None,
+                    "ply": Path(ply_path) if ply_path else None,
+                    "scene_meta": Path(scene_meta) if scene_meta else None,
+                }
+                dpg.set_value("sharp_output_text", f"SHARP Output: {ply_path}")
+                self._log(f"[SHARP] Done. PLY -> {ply_path}; scene metadata -> {scene_meta}")
+            elif event_type == "sharp_error" and isinstance(payload, str):
+                self.sharp_running = False
+                dpg.configure_item("run_sharp_button", enabled=True)
+                self._log(f"[SHARP] Lifting failed: {payload}")
+            elif event_type == "pseudo_mv_done" and isinstance(payload, dict):
+                self.pseudo_mv_running = False
+                dpg.configure_item("run_pseudo_mv_button", enabled=True)
+                dir_path = payload.get("directory")
+                ply_path = payload.get("ply")
+                scene_meta = payload.get("scene_meta")
+                self.pseudo_mv_result = {
+                    "directory": Path(dir_path) if dir_path else None,
+                    "ply": Path(ply_path) if ply_path else None,
+                    "scene_meta": Path(scene_meta) if scene_meta else None,
+                }
+                dpg.set_value("pseudo_mv_output_text", f"Pseudo-MV Output: {ply_path}")
+                self._log(f"[Pseudo-MV] Done. PLY -> {ply_path}; scene metadata -> {scene_meta}")
+            elif event_type == "pseudo_mv_error" and isinstance(payload, str):
+                self.pseudo_mv_running = False
+                dpg.configure_item("run_pseudo_mv_button", enabled=True)
+                self._log(f"[Pseudo-MV] Lifting failed: {payload}")
             elif event_type == "trellis_preload_done":
                 self.trellis_ready = True
                 self._log("[Trellis] Preload finished. Ready for generation.")
@@ -1142,6 +1602,17 @@ class WorkflowGUI:
                 status = "SC-GS Status: idle"
                 dpg.set_value("scgs_status_text", status)
                 self._log(f"[SC-GS] Editor closed (exit code {payload}).")
+            elif event_type == "diffusion_prior_done" and isinstance(payload, str):
+                self.diffusion_prior_running = False
+                dpg.configure_item("run_diffusion_prior_button", enabled=True)
+                self.refined_result = Path(payload) if payload else None
+                dpg.set_value("refined_output_text", f"Refined PLY: {payload or 'none'}")
+                self._log(f"[DiffusionPrior] Done. Refined PLY -> {payload}")
+            elif event_type == "diffusion_prior_error" and isinstance(payload, str):
+                self.diffusion_prior_running = False
+                dpg.configure_item("run_diffusion_prior_button", enabled=True)
+                dpg.set_value("refined_output_text", "Refined PLY: failed")
+                self._log(f"[DiffusionPrior] Fine-tuning failed: {payload}")
 
     # ----------------------------- Run Loop -----------------------------
     def run(self) -> None:
@@ -1161,6 +1632,12 @@ class WorkflowGUI:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Interactive workflow for SAM segmentation and PixelHacker inpainting")
+    parser.add_argument(
+        "--lifting-backend",
+        choices=["sharp", "pseudo-mv", "exscene", "cat3d", "trellis"],
+        default="sharp",
+        help="3DGS lifting backend. pseudo-mv/exscene/cat3d import or run generated multiview full-scene outputs.",
+    )
     parser.add_argument("--sam-checkpoint", default=str(REPO_ROOT / "checkpoints/sam/sam_vit_h_4b8939.pth"), help="Path to SAM checkpoint")
     parser.add_argument("--sam-release-gpu", action="store_true", help="Move SAM model back to CPU after each segmentation run")
     parser.add_argument("--pixelhacker-config", default=str(REPO_ROOT / "inpainting/config/PixelHacker_sdvae_f8d4.yaml"), help="PixelHacker config file")
@@ -1177,10 +1654,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trellis-offline", action="store_true", help="Enable offline mode for Trellis (HF cache only)")
     parser.add_argument("--trellis-preload", action="store_true", help="Preload Trellis pipeline at startup to reduce first-run latency")
     parser.add_argument("--trellis-release-gpu", action="store_true", help="Release Trellis pipeline memory after each generation")
+    parser.add_argument("--sharp-bin", default="sharp", help="SHARP executable or script path")
+    parser.add_argument("--sharp-checkpoint", default=None, help="Optional SHARP checkpoint path")
+    parser.add_argument("--sharp-output-dir", default=str(REPO_ROOT / "outputs/workflow/sharp"), help="Directory to store SHARP full-scene outputs")
+    parser.add_argument("--sharp-device", default="default", help="Device argument passed to `sharp predict`")
+    parser.add_argument("--pseudo-mv-output-dir", default=str(REPO_ROOT / "outputs/workflow/pseudo_mv"), help="Directory to store ExScene/CAT3D-style pseudo multiview outputs")
+    parser.add_argument("--pseudo-mv-command", default="", help="External generator command template with {input}, {output_dir}, {scene_meta}, and optional {ply}")
+    parser.add_argument("--pseudo-mv-reconstruction-command", default="", help="External 3DGS reconstruction command template run when the generator does not create a PLY")
+    parser.add_argument("--pseudo-mv-import-dir", default="", help="Import an existing pseudo multiview output directory instead of running --pseudo-mv-command")
+    parser.add_argument("--pseudo-mv-ply", default="", help="Explicit PLY path for an imported/generated pseudo multiview scene")
     parser.add_argument("--scgs-script", default=str(REPO_ROOT / "editing/edit_gui.py"), help="Path to SC-GS edit_gui.py script")
     parser.add_argument("--scgs-width", type=int, default=800, help="SC-GS viewport width")
     parser.add_argument("--scgs-height", type=int, default=800, help="SC-GS viewport height")
     parser.add_argument("--scgs-white-background", action="store_true", help="Launch SC-GS with white background")
+    parser.add_argument("--stable-sr-root", default="", help="Path to StableSR checkout used by diffusion-prior fine-tuning")
+    parser.add_argument("--stable-sr-env", default="stablesr", help="Conda environment name for StableSR")
+    parser.add_argument("--stable-sr-command", default="", help="StableSR command template with {input}, {output}, and optional {root}")
+    parser.add_argument("--stable-sr-worker-command", default="", help="Persistent StableSR JSONL worker command")
+    parser.add_argument("--diffusion-prior-iterations", type=int, default=1000, help="3DGS diffusion-prior fine-tuning iterations")
+    parser.add_argument("--diffusion-prior-stub", action="store_true", help="Use a local image copy stub instead of launching StableSR")
     return parser.parse_args()
 
 
