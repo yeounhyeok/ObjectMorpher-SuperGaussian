@@ -1,0 +1,31 @@
+# Local agent/job artifacts
+.agent_runs/
+config/
+scripts/
+README.md
+
+# Adapter/runtime outputs
+runs/*
+!runs/.gitkeep
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv / local env files
+.venv/
+venv/
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
