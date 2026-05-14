@@ -20,6 +20,12 @@ import types
 from pathlib import Path
 
 import torch
+from collections import namedtuple
+
+
+# Real pytorch3d.ops returns NamedTuples (.dists / .idx / .knn). OM code paths
+# use attribute access, so we mirror that here.
+_KNN = namedtuple("_KNN", ["dists", "idx", "knn"])
 
 
 def _install_pytorch3d_shim() -> None:
@@ -34,14 +40,22 @@ def _install_pytorch3d_shim() -> None:
     io_mod = types.ModuleType("pytorch3d.io")
 
     def knn_points(p1, p2, lengths1=None, lengths2=None, K=1, return_nn=False, **_):
-        # p1: [B, N1, D], p2: [B, N2, D]. Returns (sq_dist, idx, None).
+        # p1: [B, N1, D], p2: [B, N2, D]. Returns _KNN(dists, idx, knn).
         dist_sq = torch.cdist(p1, p2) ** 2
         K_eff = min(K, p2.shape[1])
         values, indices = torch.topk(dist_sq, K_eff, dim=-1, largest=False)
-        return values, indices, None
+        nn = None
+        if return_nn:
+            B, N1, D = p1.shape
+            nn = torch.gather(
+                p2.unsqueeze(1).expand(B, N1, p2.shape[1], D),
+                2,
+                indices.unsqueeze(-1).expand(-1, -1, -1, D),
+            )
+        return _KNN(dists=values, idx=indices, knn=nn)
 
     def ball_query(p1, p2, lengths1=None, lengths2=None, K=500, radius=0.2, return_nn=False, **_):
-        # p1: [B, N1, D], p2: [B, N2, D]. Returns (sq_dist [B,N1,K], idx [B,N1,K], nn|None).
+        # p1: [B, N1, D], p2: [B, N2, D]. Returns _KNN(dists, idx, knn).
         # For each query in p1, find up to K nearest neighbors in p2 within `radius`.
         # Points beyond radius get idx=-1 and sq_dist=0 (pytorch3d convention).
         dist_sq = torch.cdist(p1, p2) ** 2
@@ -52,13 +66,12 @@ def _install_pytorch3d_shim() -> None:
         values = torch.where(within, values, torch.zeros_like(values))
         nn = None
         if return_nn:
-            # Gather neighbor coordinates; out-of-radius slots get zero
             safe_idx = indices.clamp(min=0)
             B, N1, D = p1.shape
             nn = torch.gather(p2.unsqueeze(1).expand(B, N1, p2.shape[1], D), 2,
                               safe_idx.unsqueeze(-1).expand(-1, -1, -1, D))
             nn = torch.where(within.unsqueeze(-1), nn, torch.zeros_like(nn))
-        return values, indices, nn
+        return _KNN(dists=values, idx=indices, knn=nn)
 
     def cot_laplacian(verts: "torch.Tensor", faces: "torch.Tensor", eps: float = 1e-12):
         """Cotangent Laplacian + per-vertex inv-area (pytorch3d-compatible).
